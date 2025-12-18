@@ -166,15 +166,23 @@ def get_live_ml_prediction(hub_id):
 # 3. FORECASTING ENGINES & DATA SOURCES
 # ==============================================================================
 def get_wethr_data(station_code):
+    """
+    Fetches data from Wethr API using Header Authentication.
+    """
     latest_val = None
     high_val = None
     endpoint = f"{WETHR_API_BASE}/api/v1/observations.php"
-    auth = {"api_key": WETHR_API_KEY} 
+    
+    # --- CORRECTED AUTH: Header Only ---
+    headers = {
+        "X-API-Key": WETHR_API_KEY,
+        "Accept": "application/json"
+    }
 
+    # 1. Get Latest Observation
     try:
         params = {"station_code": station_code, "mode": "latest"}
-        params.update(auth)
-        r = requests.get(endpoint, params=params, timeout=5)
+        r = requests.get(endpoint, headers=headers, params=params, timeout=5)
         if r.status_code == 200:
             data = r.json() 
             if isinstance(data, dict):
@@ -182,13 +190,16 @@ def get_wethr_data(station_code):
             else: latest_val = float(data)
     except: pass
 
+    # 2. Get Wethr High
     try:
         params = {"station_code": station_code, "mode": "wethr_high"}
-        params.update(auth)
-        r = requests.get(endpoint, params=params, timeout=5)
+        r = requests.get(endpoint, headers=headers, params=params, timeout=5)
         if r.status_code == 200:
             data = r.json()
             if isinstance(data, dict):
+                # The API documentation example says "highest_probable_f" or similar, 
+                # but "wethr_high" mode usually returns the calculated value directly or in a field.
+                # Adjusting based on standard responses for high/temp.
                 high_val = data.get('high', data.get('value', data.get('temp')))
             else: high_val = float(data)
     except: pass
@@ -362,66 +373,29 @@ def get_mos_base(station, tz_str, model_type):
     return valid_runs
 
 def get_nbm_data(station, tz_str):
-    # NBM (National Blend) Scraper
     try:
         url = f"https://tgftp.nws.noaa.gov/data/forecasts/nbm/station/{station}.txt"
         r = requests.get(url, timeout=3)
         if r.status_code != 200: return None, None
         
         text = r.text
-        # Find start of data
         lines = text.splitlines()
         
-        # Parse timestamp from header (optional for freshness check)
-        # Parse data rows
         utc_line = next((l for l in lines if "UTC" in l), None)
         tmp_line = next((l for l in lines if "TMP" in l), None)
         
         if not utc_line or not tmp_line: return None, None
         
-        # NBM formatting is fixed width, but splitting by space usually works if aligned
-        # The NBM text output usually has date lines like "DT 12/18"
-        # We need to find the "DT" line to anchor dates
-        dt_line = next((l for l in lines if l.strip().startswith("DT")), None)
-        
-        if not dt_line: return None, None
-        
-        # Parsing NBM text is complex due to varying column widths. 
-        # Strategy: Use index positions from UTC line
-        # UTC line: "UTC 06 07 08 ..."
-        # DT line:  "DT  12/18 ..."
-        
-        # Simplify: Just extract all numbers and align them
-        # Note: This simple method assumes 1-hour intervals. 
-        # NBM text is usually hourly for first 24-36h.
-        
-        hours = []
-        temps = []
-        
-        # Extract hours from UTC line (skipping 'UTC' label)
-        # Be careful of 3-digit hours or weird spacing
-        hours = [int(x) for x in utc_line.replace("UTC","").split()]
-        
-        # Extract temps from TMP line
-        temps = [int(x) for x in tmp_line.replace("TMP","").split()]
-        
-        # Extract Dates from DT line
-        # Format: "DT  12/18  12/19" - spans many columns
-        # This is hard to robustly parse with simple split. 
-        # Alternative: Reconstruct timeline from Current UTC + Hours
-        
-        # Find Model Run Time from first line: "KNYC   NBM V4.1   12/18/2025  1500 UTC"
         header_match = re.search(r'(\d{1,2}/\d{1,2}/\d{4})\s+(\d{4})\s+UTC', lines[0])
         if not header_match: return None, None
         
         run_dt = datetime.strptime(f"{header_match.group(1)} {header_match.group(2)}", "%m/%d/%Y %H%M").replace(tzinfo=pytz.utc)
         
+        hours = [int(x) for x in utc_line.replace("UTC","").split()]
+        temps = [int(x) for x in tmp_line.replace("TMP","").split()]
+        
         curr_date = run_dt.date()
         run_hour = run_dt.hour
-        
-        # Align start
-        # If first data hour < run hour, it's next day? No, NBM usually starts near run time.
-        # But NBM text usually lists past hours too? No, usually forecast only.
         if hours[0] < run_hour: curr_date += timedelta(days=1)
         
         data_points = []
@@ -560,10 +534,10 @@ def get_kalshi():
 def calculate_weighted_blend(city_rows):
     weights = {
         'NWS Official': 5.0, 
-        'NBM': 4.0,           # NEW: High weight for National Blend
+        'NBM': 4.0,           
         'LAMP': 3.5,         
         'GFS MOS': 2.0,      
-        'NAM MOS': 2.0,       # NEW: Moderate weight
+        'NAM MOS': 2.0,       
         'HRRR': 1.5,         
         'ECMWF': 1.0,        
         'GFS': 0.5,
@@ -671,7 +645,7 @@ def build_html(full_data, ml_preds, kalshi_df, history):
                 elif temp > r['High']: dist = temp - r['High']
                 
                 # --- UPDATED SCORING RULES ---
-                if model in ['LAMP', 'HRRR', 'GFS MOS', 'NAM MOS', 'NBM']: # Added NAM & NBM here
+                if model in ['LAMP', 'HRRR', 'GFS MOS', 'NAM MOS', 'NBM']: 
                     total_possible += 5
                     if dist == 0: score += 5
                     elif dist <= 1.01: score += 3 
@@ -736,7 +710,7 @@ if __name__ == "__main__":
     for code, cfg in LOCATIONS.items():
         print(f"Processing {code}...")
         
-        # --- 0. Wethr API ---
+        # --- 0. Wethr API (Custom) ---
         w_live, w_high = get_wethr_data(cfg['station_id'])
         if w_live is not None or w_high is not None:
              full_data.append({'Airport': code, 'Model': f"Wethr (Live {w_live})", 'Today': w_high, 'Tomorrow': None})
