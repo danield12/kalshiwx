@@ -162,47 +162,33 @@ def get_live_ml_prediction(hub_id):
 # 3. FORECASTING ENGINES
 # ==============================================================================
 def track_model_history(station_code, model_name, today_val, tmw_val):
-    """
-    Saves history for ANY model to a JSON file. 
-    Only saves a new entry if the values differ from the last saved entry 
-    (to avoid duplicates on frequent script runs).
-    """
     if not os.path.exists("Kalshi"): os.makedirs("Kalshi")
     file_path = f"Kalshi/{station_code}_{model_name}_log.json"
     history = []
     
-    # 1. Load existing
     if os.path.exists(file_path):
         try:
             with open(file_path, 'r') as f: history = json.load(f)
         except: pass
 
-    # 2. Check if new data is different from the absolute latest entry
     is_new = True
     if history:
         last = history[0]
-        # If values match exactly, assume it's the same run cycle (no update)
         if last['today'] == today_val and last['tmw'] == tmw_val:
             is_new = False
-            # Update timestamp to show it was verified recently? 
-            # No, keep original timestamp to show when that run FIRST appeared.
 
     if is_new:
         now_utc = datetime.now(pytz.utc)
         new_entry = {
-            'ts': now_utc.strftime('%Y-%m-%d %H:%M'), # For debugging
-            'label': now_utc.strftime('%H:%M'),       # For display
+            'ts': now_utc.strftime('%Y-%m-%d %H:%M'), 
+            'label': now_utc.strftime('%H:%M'),       
             'today': today_val, 
             'tmw': tmw_val
         }
         history.insert(0, new_entry)
         
-    # 3. Prune (Keep last 10, we only display top 2 but keep a buffer)
     history = history[:10]
-    
-    # 4. Save
     with open(file_path, 'w') as f: json.dump(history, f)
-    
     return history
 
 def get_lamp_data(station, tz_str):
@@ -393,7 +379,7 @@ def get_global_model(lat, lon, tz, model_code):
                 
         except:
             # If it fails, wait 2 seconds and try again
-            time.sleep(10)
+            time.sleep(2)
             continue
             
     return None, None
@@ -445,10 +431,10 @@ def get_kalshi():
 # ==============================================================================
 def calculate_weighted_blend(city_rows):
     weights = {
-        'NWS Official': 5.0, 
-        'LAMP': 3.5,         
-        'GFS MOS': 2.0,      
-        'HRRR': 1.5,         
+        'NWS Official': 2, 
+        'LAMP': 5,         
+        'GFS MOS': 2.5,      
+        'HRRR': 2.5,         
         'ECMWF': 1.0,        
         'GFS': 0.5,
         'GEM': 0.5,
@@ -474,7 +460,7 @@ def calculate_weighted_blend(city_rows):
             
     today_blend = t1_sum / t1_w_sum if t1_w_sum > 0 else None
     tmw_blend = t2_sum / t2_w_sum if t2_w_sum > 0 else None
-    
+
     return today_blend, tmw_blend
 
 def build_html(full_data, ml_preds, kalshi_df, history):
@@ -551,12 +537,53 @@ def build_html(full_data, ml_preds, kalshi_df, history):
         k_all = kalshi_df[kalshi_df['Airport'] == code].copy() if not kalshi_df.empty else pd.DataFrame()
         
         wb_today, wb_tmw = calculate_weighted_blend(city_rows)
-        cons = wb_today if wb_today else 0
+
+        # --- UPDATED VALUE CALCULATION LOGIC ---
+        def calculate_market_value(r, current_forecasts):
+            day_col = 'Today' if r['Day'] == 'Today' else 'Tomorrow'
+            score = 0
+            total_possible = 0
+            
+            for f in current_forecasts:
+                model = f['Model']
+                if "Prev" in model: continue 
+                
+                temp = f[day_col]
+                if temp is None: continue
+                
+                # Check distance (0 if in range, else distance to boundary)
+                dist = 0
+                if temp < r['Low']: dist = r['Low'] - temp
+                elif temp > r['High']: dist = temp - r['High']
+                
+                # Rules
+                if model in ['LAMP', 'HRRR', 'GFS MOS']:
+                    total_possible += 5
+                    if dist == 0: score += 5
+                    elif dist <= 1.01: score += 3 # 1.01 for float safety
+                    elif dist <= 2.01: score += 1
+                elif model == 'NWS Official':
+                    total_possible += 3
+                    if dist == 0: score += 3
+                    elif dist <= 1.01: score += 1
+                elif model in ['ECMWF', 'GFS', 'ICON', 'GEM']:
+                    total_possible += 1
+                    if dist == 0: score += 1
+                    elif dist <= 1.01: score += 0.5
+            
+            if total_possible == 0: return -r['Price']
+            
+            probability = (score / total_possible) * 100
+            return probability - r['Price']
+        # ---------------------------------------
 
         def make_k_table(df_sub):
             if df_sub.empty: return "<tr><td colspan='3' class='text-center text-muted'>No Active Markets</td></tr>"
             df_sub = df_sub.sort_values('Low', ascending=True)
-            df_sub['Val'] = df_sub.apply(lambda r: (100-r['Price']) if r['Low'] <= cons <= r['High'] else -r['Price'], axis=1)
+            
+            # Apply new scoring
+            df_sub['Val'] = df_sub.apply(lambda r: calculate_market_value(r, city_rows), axis=1)
+            
             rows = ""
             for _, r in df_sub.iterrows():
                 c = "#4ade80" if r['Val']>5 else ("#f87171" if r['Val']<0 else "#94a3b8")
@@ -664,5 +691,3 @@ if __name__ == "__main__":
         f.write(build_html(full_data, ml_preds, kalshi, history))
     
     print(f"SUCCESS: Dashboard saved to {output_path}")
-
-
