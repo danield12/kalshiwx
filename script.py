@@ -440,6 +440,7 @@ def get_kalshi():
     kalshi_map = {v['kalshi']: k for k, v in LOCATIONS.items()}
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
+    # 1. Fetch Raw Data
     for kt, city in kalshi_map.items():
         try:
             r = requests.get(url, params={"series_ticker": kt, "status": "open"}, headers=headers, timeout=5)
@@ -452,26 +453,68 @@ def get_kalshi():
                     if day_type:
                         sub = m.get('subtitle','')
                         last_part = m['ticker'].split('-')[-1]
+                        
+                        # Extract the numeric value (strike price)
+                        s_val = 0
                         s_val_match = re.search(r'([\d.]+)', last_part)
                         if s_val_match:
                             s_val = float(s_val_match.group(1))
-                            low, high = s_val, s_val + 0.9
-                            if not sub:
-                                s_type = 'B' if 'B' in last_part else 'T'
-                                if s_type == 'B': sub = f"{int(s_val)}° to {int(s_val)+1}°"
-                                else: sub = f"Threshold {s_val}°"
+                        
+                        # Default assumption: It's a 1-degree band
+                        low, high = s_val, s_val + 0.9
+                        
+                        # Detect if it's a specific band (B) or Threshold (T)
+                        # We will refine 'Threshold' logic in the 2nd pass below
+                        if not sub:
+                            s_type = 'B' if 'B' in last_part else 'T'
+                            if s_type == 'B': sub = f"{int(s_val)}° to {int(s_val)+1}°"
+                            else: sub = f"Threshold {s_val}°"
 
-                            if 'below' in sub or 'less' in sub: high = s_val; low = -999
-                            elif 'above' in sub or 'greater' in sub: low = s_val; high = 999
-                            elif 'to' in sub:
-                                 try:
-                                     parts = sub.replace('°','').split(' to ')
-                                     low, high = float(parts[0]), float(parts[1])
-                                 except: pass
-                            data.append({'Airport': city, 'Range': sub, 'Price': m['yes_bid'], 'Low': low, 'High': high, 'Day': day_type})
+                        # Handle explicit API text if present
+                        if 'below' in sub.lower() or 'less' in sub.lower(): high = s_val; low = -999
+                        elif 'above' in sub.lower() or 'greater' in sub.lower(): low = s_val; high = 999
+                        elif 'to' in sub:
+                                try:
+                                    parts = sub.replace('°','').split(' to ')
+                                    low, high = float(parts[0]), float(parts[1])
+                                except: pass
+                                
+                        data.append({
+                            'Airport': city, 
+                            'Range': sub, 
+                            'Price': m['yes_bid'], 
+                            'Low': low, 
+                            'High': high, 
+                            'Day': day_type,
+                            'Strike': s_val # Keep for sorting
+                        })
                 except: continue
         except: pass
-    return pd.DataFrame(data)
+        
+    # 2. Post-Processing: Fix the Tails (Lowest = Below, Highest = Above)
+    df = pd.DataFrame(data)
+    if not df.empty:
+        # We need to iterate over each City + Day group to find the min/max strike
+        for (city, day), group in df.groupby(['Airport', 'Day']):
+            if group.empty: continue
+            
+            min_strike = group['Strike'].min()
+            max_strike = group['Strike'].max()
+            
+            # Update the Lowest Threshold
+            # If the row has the min_strike and "Threshold" in name, convert to "Below"
+            mask_min = (df['Airport'] == city) & (df['Day'] == day) & (df['Strike'] == min_strike) & (df['Range'].str.contains('Threshold'))
+            df.loc[mask_min, 'Range'] = f"{int(min_strike)}° and Below"
+            df.loc[mask_min, 'Low'] = -999
+            df.loc[mask_min, 'High'] = min_strike
+            
+            # Update the Highest Threshold
+            mask_max = (df['Airport'] == city) & (df['Day'] == day) & (df['Strike'] == max_strike) & (df['Range'].str.contains('Threshold'))
+            df.loc[mask_max, 'Range'] = f"{int(max_strike)}° and Above"
+            df.loc[mask_max, 'Low'] = max_strike
+            df.loc[mask_max, 'High'] = 999
+
+    return df
 
 # ==============================================================================
 # 4. WEIGHTED BLEND LOGIC
@@ -738,3 +781,4 @@ if __name__ == "__main__":
         f.write(build_html(full_data, ml_preds, kalshi, history))
     
     print(f"SUCCESS: Dashboard saved to {output_path}")
+
