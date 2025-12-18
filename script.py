@@ -6,12 +6,10 @@ import os
 import re
 import time
 import warnings
-import webbrowser
 from datetime import datetime, timedelta
 from io import StringIO
 from sklearn.ensemble import HistGradientBoostingRegressor
 import pytz
-from IPython.display import HTML, display
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
@@ -242,66 +240,85 @@ def get_lamp_data(station, tz_str):
     return best_today, best_tmw, history
 
 _MOS_CACHE = {}
-def get_mos(station):
-    # 1. Define all possible run times (Reverse order isn't strictly necessary as we compare dates, but good for efficiency)
+def get_mos(station, tz_str):
     runs = ['18', '12', '06', '00']
+    valid_runs = []
     
-    best_dt = None
-    best_block = None
-    
-    # 2. Loop through all runs to find the freshest data
+    # 1. Collect all valid blocks
     for r in runs:
         url = f"https://www.weather.gov/source/mdl/MOS/GFSMAV.t{r}z"
-        
-        # Fetch or use Cache
+        # Cache logic
         if url not in _MOS_CACHE:
             try: 
-                response = requests.get(url, timeout=3)
-                if response.status_code == 200:
-                    _MOS_CACHE[url] = response.text
-                else:
-                    _MOS_CACHE[url] = "" # Cache failure as empty to avoid retries
-            except: 
-                continue
+                resp = requests.get(url, timeout=2)
+                if resp.status_code == 200: _MOS_CACHE[url] = resp.text
+                else: _MOS_CACHE[url] = ""
+            except: continue
 
         text = _MOS_CACHE.get(url, "")
         if not text: continue
-
-        # 3. Find the station block
-        # Regex looks for Station ID followed by content until the next station header (4 chars) or End of String
-        match = re.search(rf"({station}.*?)(\n[A-Z]{{4}}|\Z)", text, re.DOTALL)
-        if not match: continue
         
+        # Regex to find station block
+        match = re.search(rf"({station}\s+GFS.*?)(?=\n[A-Z]{{4}}|\Z)", text, re.DOTALL)
+        if not match: continue
         block = match.group(1)
         
-        # 4. Extract Date/Time from the block to verify freshness
-        # Looks for line like: "KNYC   GFS MOS GUIDANCE   12/18/2025  1200 UTC"
+        # Parse Date/Time from Header
         date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{4})\s+(\d{4})\s+UTC", block)
+        if not date_match: continue
         
-        if date_match:
-            try:
-                dt_str = f"{date_match.group(1)} {date_match.group(2)}"
-                # Parse to datetime object (UTC)
-                current_dt = datetime.strptime(dt_str, "%m/%d/%Y %H%M").replace(tzinfo=pytz.utc)
-                
-                # Compare: Is this the newest one we've found so far?
-                if best_dt is None or current_dt > best_dt:
-                    best_dt = current_dt
-                    best_block = block
-            except:
-                continue
-
-    # 5. Parse the best block found
-    if not best_block: return None, None
-    
-    for line in best_block.split('\n'):
-        if 'X/N' in line or 'N/X' in line:
-            # Clean string and extract numbers
-            nums = [int(n) for n in re.findall(r'-?\d+', line.replace('X/N','').replace('N/X',''))]
-            if len(nums) >= 3: return nums[0], nums[2]
-            if len(nums) >= 2: return nums[0], nums[1]
+        try:
+            dt_str = f"{date_match.group(1)} {date_match.group(2)}"
+            run_dt = datetime.strptime(dt_str, "%m/%d/%Y %H%M").replace(tzinfo=pytz.utc)
             
-    return None, None
+            # --- Parse Hourly Data for this block ---
+            lines = block.split('\n')
+            hr_line = next((l for l in lines if l.strip().startswith('HR')), None)
+            tmp_line = next((l for l in lines if l.strip().startswith('TMP')), None)
+            
+            if hr_line and tmp_line:
+                hours = [int(x) for x in hr_line.split()[1:]]
+                temps = [int(x) for x in tmp_line.split()[1:]]
+                
+                curr_date = run_dt.date()
+                run_hour = run_dt.hour
+                if hours[0] < run_hour: curr_date += timedelta(days=1)
+                
+                data_points = []
+                prev_h = -1
+                for h, t in zip(hours, temps):
+                    if h < prev_h: curr_date += timedelta(days=1)
+                    dt_utc = datetime(curr_date.year, curr_date.month, curr_date.day, h, 0, 0, tzinfo=pytz.utc)
+                    dt_local = dt_utc.astimezone(pytz.timezone(tz_str))
+                    data_points.append({'date': dt_local.date(), 'hour': dt_local.hour, 'temp': t})
+                    prev_h = h
+
+                local_today = datetime.now(pytz.timezone(tz_str)).date()
+                local_tmw = local_today + timedelta(days=1)
+                
+                today_temps = [d for d in data_points if d['date'] == local_today]
+                tmw_temps = [d for d in data_points if d['date'] == local_tmw]
+
+                t_high = None
+                if today_temps:
+                    # Only count as valid "Today" high if the run started before 2pm local
+                    if today_temps[0]['hour'] <= 14: 
+                        t_high = max(d['temp'] for d in today_temps)
+                
+                tm_high = max(d['temp'] for d in tmw_temps) if tmw_temps else None
+                
+                if t_high is not None or tm_high is not None:
+                    valid_runs.append({
+                        'run_str': f"{r}z",
+                        'dt': run_dt,
+                        'today': t_high,
+                        'tmw': tm_high
+                    })
+        except: continue
+
+    # Sort by datetime descending (Newest first)
+    valid_runs.sort(key=lambda x: x['dt'], reverse=True)
+    return valid_runs
 
 def get_nws_official(lat, lon, tz_str):
     try:
@@ -407,7 +424,13 @@ def calculate_weighted_blend(city_rows):
 
     for r in city_rows:
         model_name = r['Model']
-        w = weights.get(model_name, 0.5) # Default low weight for unknown models
+        
+        # --- NEW: Ignore older runs in the weighted average ---
+        if "Prev" in model_name: 
+            continue 
+        # -----------------------------------------------------
+
+        w = weights.get(model_name, 0.5) 
         
         if r['Today'] is not None:
             t1_sum += r['Today'] * w
@@ -561,8 +584,28 @@ if __name__ == "__main__":
         history[code] = l_h
         if l_t: full_data.append({'Airport': code, 'Model': 'LAMP', 'Today': l_t, 'Tomorrow': l_tm})
         
-        m_t, m_tm = get_mos(cfg['station_id'])
-        if m_t: full_data.append({'Airport': code, 'Model': 'GFS MOS', 'Today': m_t, 'Tomorrow': m_tm})
+        # --- MODIFIED GFS MOS LOGIC (Multi-Run) ---
+        mos_list = get_mos(cfg['station_id'], cfg['tz'])
+        
+        if mos_list:
+            # 1. The Best/Freshest Run (Used for Math)
+            best = mos_list[0]
+            full_data.append({
+                'Airport': code, 
+                'Model': 'GFS MOS', 
+                'Today': best['today'], 
+                'Tomorrow': best['tmw']
+            })
+            
+            # 2. Previous Runs (Display only, max 3)
+            for old_run in mos_list[1:4]:
+                full_data.append({
+                    'Airport': code, 
+                    'Model': f"GFS MOS (Prev {old_run['run_str']})", 
+                    'Today': old_run['today'], 
+                    'Tomorrow': old_run['tmw']
+                })
+        # ------------------------------------------
         
         for name, m_code in GLOBAL_MODELS.items():
             g_t, g_tm = get_global_model(cfg['lat'], cfg['lon'], cfg['tz'], m_code)
@@ -582,5 +625,3 @@ if __name__ == "__main__":
         f.write(build_html(full_data, ml_preds, kalshi, history))
     
     print(f"SUCCESS: Dashboard saved to {output_path}")
-
-
