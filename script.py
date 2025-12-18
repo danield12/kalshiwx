@@ -380,6 +380,14 @@ def calculate_weighted_blend(city_rows):
     return today_blend, tmw_blend
 
 def build_html(full_data, ml_preds, kalshi_df, history):
+    # --- NEW: Get Current Times ---
+    now_utc = datetime.now(pytz.utc)
+    now_est = now_utc.astimezone(pytz.timezone('US/Eastern'))
+    
+    time_est_str = now_est.strftime('%Y-%m-%d %I:%M:%S %p %Z')
+    time_utc_str = now_utc.strftime('%Y-%m-%d %H:%M:%S %Z')
+    # ------------------------------
+
     html = """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Weather Master V17</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <script>
@@ -430,7 +438,16 @@ def build_html(full_data, ml_preds, kalshi_df, history):
         .kalshi-table { table-layout: fixed; width: 100%; }
         .kalshi-table td { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     </style>
-    </head><body class="p-4"><h3>⚡ Weather Master V17 <small class="text-muted fs-6 ms-2">Weighted Consensus</small></h3><hr>"""
+    </head><body class="p-4">
+    
+    <div class="d-flex justify-content-between align-items-end mb-2">
+        <h3 class="m-0">⚡ Weather Master V17 <small class="text-muted fs-6 ms-2">Weighted Consensus</small></h3>
+        <div class="text-end" style="font-size: 0.85rem; color: #94a3b8;">
+            <div>Run Time (EST): <span style="color:#e2e8f0; font-weight:600">""" + time_est_str + """</span></div>
+            <div>Run Time (UTC): <span style="color:#e2e8f0; font-weight:600">""" + time_utc_str + """</span></div>
+        </div>
+    </div>
+    <hr>"""
     
     for code, cfg in LOCATIONS.items():
         city_rows = [d for d in full_data if d['Airport'] == code]
@@ -458,7 +475,6 @@ def build_html(full_data, ml_preds, kalshi_df, history):
 
         html += f"""<div class="row"><div class="col-12"><h4>{cfg['name']} ({code}) <span class="badge badge-ml">Live ML: {city_ml[0]}</span></h4></div>
         
-        <!-- MODELS -->
         <div class="col-md-5"><div class="card"><div class="card-header">Forecast Models</div><table class="table table-dark table-sm mb-0">
         <thead><tr><th class="col-model" style="color:#fff !important">Model</th><th class="col-temp" style="color:#fff !important">Today High</th><th class="col-temp" style="color:#fff !important">Tom High</th></tr></thead><tbody>"""
         
@@ -468,13 +484,11 @@ def build_html(full_data, ml_preds, kalshi_df, history):
         for r in city_rows: html += f"<tr><td>{r['Model']}</td><td class='text-center'>{r['Today']}</td><td class='text-center'>{r['Tomorrow']}</td></tr>"
         html += """</tbody></table></div></div>
         
-        <!-- LAMP HISTORY -->
         <div class="col-md-3"><div class="card"><div class="card-header">LAMP History (UTC)</div><div style="max-height:300px;overflow:auto">
         <table class="table table-dark table-sm mb-0"><thead><tr><th style="color:#fff !important">Run</th><th style="color:#fff !important">Today</th><th style="color:#fff !important">Tom</th></tr></thead><tbody>"""
         for h in city_hist: html += f"<tr><td>{h['Run']}</td><td class='text-center'>{h['Today']}</td><td class='text-center'>{h['Tmw']}</td></tr>"
         html += """</tbody></table></div></div></div>
         
-        <!-- KALSHI MARKET -->
         <div class="col-md-4"><div class="card">
             <div class="card-header">Kalshi <button id="{code}-btn" class="btn btn-outline-light kalshi-btn" onclick="toggleKalshi('{code}')">Show Tomorrow</button></div>
             <div style="max-height:300px;overflow:auto">
@@ -525,3 +539,4 @@ if __name__ == "__main__":
         f.write(build_html(full_data, ml_preds, kalshi, history))
     
     print(f"SUCCESS: Dashboard saved to {output_path}")
+
