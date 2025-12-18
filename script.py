@@ -574,38 +574,44 @@ if __name__ == "__main__":
     # 1. Run Data Collection
     for code, cfg in LOCATIONS.items():
         print(f"Processing {code}...")
+        
+        # --- 1. ML Prediction ---
         pred, note = get_live_ml_prediction(cfg['station_id'])
         ml_preds[code] = (pred, note)
         
+        # --- 2. NWS Official ---
         n_t, n_tm = get_nws_official(cfg['lat'], cfg['lon'], cfg['tz'])
         if n_t is not None or n_tm is not None:
             full_data.append({'Airport': code, 'Model': 'NWS Official', 'Today': n_t, 'Tomorrow': n_tm})
+        time.sleep(0.2) # <--- Pause for NWS API
         
+        # --- 3. LAMP ---
         l_t, l_tm, l_h = get_lamp_data(cfg['station_id'], cfg['tz'])
         history[code] = l_h
         if l_t: full_data.append({'Airport': code, 'Model': 'LAMP', 'Today': l_t, 'Tomorrow': l_tm})
+        time.sleep(0.2) # <--- Pause for NWS LAMP
         
-        # --- GFS MOS (Using Text Parsing History) ---
+        # --- 4. GFS MOS ---
         mos_list = get_mos(cfg['station_id'], cfg['tz'])
         if mos_list:
             best = mos_list[0]
             full_data.append({'Airport': code, 'Model': 'GFS MOS', 'Today': best['today'], 'Tomorrow': best['tmw']})
-            # Show last 2 previous runs
             for old_run in mos_list[1:3]:
                 full_data.append({'Airport': code, 'Model': f"GFS MOS (Prev {old_run['run_str']})", 'Today': old_run['today'], 'Tomorrow': old_run['tmw']})
+        time.sleep(0.2) # <--- Pause for NWS MOS
         
-        # --- GLOBAL MODELS (Using JSON History) ---
+        # --- 5. Global Models (Open-Meteo) ---
         for name, m_code in GLOBAL_MODELS.items():
             g_t, g_tm = get_global_model(cfg['lat'], cfg['lon'], cfg['tz'], m_code)
+            
             if g_t: 
-                # 1. Add Current
+                # Add Current
                 full_data.append({'Airport': code, 'Model': name, 'Today': g_t, 'Tomorrow': g_tm})
                 
-                # 2. Update History Log
+                # Update History Log
                 model_hist = track_model_history(code, name, g_t, g_tm)
                 
-                # 3. Add Previous 2 distinct runs (skipping index 0 which is current)
-                # We skip index 0 because we just added the "Current" row above.
+                # Add Previous 2 distinct runs
                 count = 0
                 for item in model_hist[1:]:
                     if count >= 2: break
@@ -616,6 +622,8 @@ if __name__ == "__main__":
                         'Tomorrow': item['tmw']
                     })
                     count += 1
+            
+            time.sleep(0.5) # <--- CRITICAL: Pause between Open-Meteo calls
 
     # 2. Get Kalshi Data
     kalshi = get_kalshi()
@@ -631,3 +639,4 @@ if __name__ == "__main__":
         f.write(build_html(full_data, ml_preds, kalshi, history))
     
     print(f"SUCCESS: Dashboard saved to {output_path}")
+
