@@ -356,22 +356,47 @@ def get_nws_official(lat, lon, tz_str):
     except: return None, None
 
 def get_global_model(lat, lon, tz, model_code):
-    try:
-        url = "https://api.open-meteo.com/v1/forecast"
-        params = {"latitude": lat, "longitude": lon, "hourly": "temperature_2m", "timezone": tz, "forecast_days": 3, "models": model_code}
-        r = requests.get(url, params=params, timeout=3)
-        data = r.json()['hourly']
-        df = pd.DataFrame({'time': data['time'], 'temp': data['temperature_2m']})
-        df['dt'] = pd.to_datetime(df['time'])
-        df['date'] = df['dt'].dt.date
-        today = datetime.now(pytz.timezone(tz)).date()
-        tmw = today + timedelta(days=1)
-        t1 = df[df['date'] == today]['temp'].max()
-        t2 = df[df['date'] == tmw]['temp'].max()
-        if not pd.isna(t1): t1 = (t1 * 9/5) + 32
-        if not pd.isna(t2): t2 = (t2 * 9/5) + 32
-        return round(t1, 1), round(t2, 1)
-    except: return None, None
+    # Try up to 3 times
+    for attempt in range(3):
+        try:
+            url = "https://api.open-meteo.com/v1/forecast"
+            params = {
+                "latitude": lat, 
+                "longitude": lon, 
+                "hourly": "temperature_2m", 
+                "timezone": tz, 
+                "forecast_days": 3, 
+                "models": model_code
+            }
+            
+            # INCREASED TIMEOUT to 10 seconds
+            r = requests.get(url, params=params, timeout=10)
+            
+            if r.status_code == 200:
+                data = r.json().get('hourly')
+                if not data: return None, None
+                
+                df = pd.DataFrame({'time': data['time'], 'temp': data['temperature_2m']})
+                df['dt'] = pd.to_datetime(df['time'])
+                df['date'] = df['dt'].dt.date
+                
+                today = datetime.now(pytz.timezone(tz)).date()
+                tmw = today + timedelta(days=1)
+                
+                t1 = df[df['date'] == today]['temp'].max()
+                t2 = df[df['date'] == tmw]['temp'].max()
+                
+                if not pd.isna(t1): t1 = (t1 * 9/5) + 32
+                if not pd.isna(t2): t2 = (t2 * 9/5) + 32
+                
+                return round(t1, 1), round(t2, 1)
+                
+        except:
+            # If it fails, wait 2 seconds and try again
+            time.sleep(10)
+            continue
+            
+    return None, None
 
 def get_kalshi():
     print("\n--- Fetching Kalshi Markets ---")
@@ -639,4 +664,5 @@ if __name__ == "__main__":
         f.write(build_html(full_data, ml_preds, kalshi, history))
     
     print(f"SUCCESS: Dashboard saved to {output_path}")
+
 
