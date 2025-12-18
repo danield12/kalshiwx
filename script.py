@@ -20,6 +20,10 @@ warnings.filterwarnings("ignore")
 # ==============================================================================
 WUNDERGROUND_API_KEY = 'e1f10a1e78da46f5b10a1e78da96f525' 
 
+# --- NEW: WETHR API CREDENTIALS ---
+WETHR_API_KEY = '36a3796100f0453ebf5ee6c99f6ac5db5a314afd2bcdf9049fef1edca7b0d710'
+WETHR_API_BASE = 'https://wethr.net'
+
 LOCATIONS = {
     "NYC": {"lat": 40.7851, "lon": -73.9683, "tz": "America/New_York", "station_id": "KNYC", "kalshi": "KXHIGHNY", "name": "New York (Central Park)"},
     "MDW": {"lat": 41.7868, "lon": -87.7522, "tz": "America/Chicago", "station_id": "KMDW", "kalshi": "KXHIGHCHI", "name": "Chicago Midway"},
@@ -159,8 +163,51 @@ def get_live_ml_prediction(hub_id):
     except: return f"{live_mean:.1f}", "Avg (Error)"
 
 # ==============================================================================
-# 3. FORECASTING ENGINES
+# 3. FORECASTING ENGINES & DATA SOURCES
 # ==============================================================================
+def get_wethr_data(station_code):
+    """
+    Fetches data from the custom Wethr API.
+    Mode 1: Latest (Current Temp)
+    Mode 2: Wethr High (Trading Day High)
+    """
+    latest_val = None
+    high_val = None
+    endpoint = f"{WETHR_API_BASE}/api/v1/observations.php"
+    
+    # Common auth param (adjust if API expects 'key' or 'token')
+    auth = {"api_key": WETHR_API_KEY} 
+
+    # 1. Get Latest Observation
+    try:
+        params = {"station_code": station_code, "mode": "latest"}
+        params.update(auth)
+        
+        r = requests.get(endpoint, params=params, timeout=5)
+        if r.status_code == 200:
+            data = r.json() 
+            if isinstance(data, dict):
+                latest_val = data.get('temp', data.get('temperature', data.get('value')))
+            else:
+                latest_val = float(data)
+    except: pass
+
+    # 2. Get Wethr High
+    try:
+        params = {"station_code": station_code, "mode": "wethr_high"}
+        params.update(auth)
+        
+        r = requests.get(endpoint, params=params, timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, dict):
+                high_val = data.get('high', data.get('value', data.get('temp')))
+            else:
+                high_val = float(data)
+    except: pass
+    
+    return latest_val, high_val
+
 def track_model_history(station_code, model_name, today_val, tmw_val):
     if not os.path.exists("Kalshi"): os.makedirs("Kalshi")
     file_path = f"Kalshi/{station_code}_{model_name}_log.json"
@@ -431,10 +478,10 @@ def get_kalshi():
 # ==============================================================================
 def calculate_weighted_blend(city_rows):
     weights = {
-        'NWS Official': 2, 
-        'LAMP': 5,         
-        'GFS MOS': 2.5,      
-        'HRRR': 2.5,         
+        'NWS Official': 5.0, 
+        'LAMP': 3.5,         
+        'GFS MOS': 2.0,      
+        'HRRR': 1.5,         
         'ECMWF': 1.0,        
         'GFS': 0.5,
         'GEM': 0.5,
@@ -447,6 +494,7 @@ def calculate_weighted_blend(city_rows):
     for r in city_rows:
         model_name = r['Model']
         if "Prev" in model_name: continue # Ignore history in blend
+        if "Wethr" in model_name: continue # Ignore 'Truth' API in blend
 
         w = weights.get(model_name, 0.5) 
         
@@ -460,7 +508,7 @@ def calculate_weighted_blend(city_rows):
             
     today_blend = t1_sum / t1_w_sum if t1_w_sum > 0 else None
     tmw_blend = t2_sum / t2_w_sum if t2_w_sum > 0 else None
-
+    
     return today_blend, tmw_blend
 
 def build_html(full_data, ml_preds, kalshi_df, history):
@@ -538,7 +586,7 @@ def build_html(full_data, ml_preds, kalshi_df, history):
         
         wb_today, wb_tmw = calculate_weighted_blend(city_rows)
 
-        # --- UPDATED VALUE CALCULATION LOGIC ---
+        # --- KALSHI VALUE SCORING ---
         def calculate_market_value(r, current_forecasts):
             day_col = 'Today' if r['Day'] == 'Today' else 'Tomorrow'
             score = 0
@@ -546,7 +594,7 @@ def build_html(full_data, ml_preds, kalshi_df, history):
             
             for f in current_forecasts:
                 model = f['Model']
-                if "Prev" in model: continue 
+                if "Prev" in model or "Wethr" in model: continue 
                 
                 temp = f[day_col]
                 if temp is None: continue
@@ -560,7 +608,7 @@ def build_html(full_data, ml_preds, kalshi_df, history):
                 if model in ['LAMP', 'HRRR', 'GFS MOS']:
                     total_possible += 5
                     if dist == 0: score += 5
-                    elif dist <= 1.01: score += 3 # 1.01 for float safety
+                    elif dist <= 1.01: score += 3 
                     elif dist <= 2.01: score += 1
                 elif model == 'NWS Official':
                     total_possible += 3
@@ -580,10 +628,7 @@ def build_html(full_data, ml_preds, kalshi_df, history):
         def make_k_table(df_sub):
             if df_sub.empty: return "<tr><td colspan='3' class='text-center text-muted'>No Active Markets</td></tr>"
             df_sub = df_sub.sort_values('Low', ascending=True)
-            
-            # Apply new scoring
             df_sub['Val'] = df_sub.apply(lambda r: calculate_market_value(r, city_rows), axis=1)
-            
             rows = ""
             for _, r in df_sub.iterrows():
                 c = "#4ade80" if r['Val']>5 else ("#f87171" if r['Val']<0 else "#94a3b8")
@@ -627,6 +672,11 @@ if __name__ == "__main__":
     for code, cfg in LOCATIONS.items():
         print(f"Processing {code}...")
         
+        # --- 0. Wethr API (Custom) ---
+        w_live, w_high = get_wethr_data(cfg['station_id'])
+        if w_live is not None or w_high is not None:
+             full_data.append({'Airport': code, 'Model': f"Wethr (Live {w_live})", 'Today': w_high, 'Tomorrow': None})
+
         # --- 1. ML Prediction ---
         pred, note = get_live_ml_prediction(cfg['station_id'])
         ml_preds[code] = (pred, note)
@@ -635,13 +685,13 @@ if __name__ == "__main__":
         n_t, n_tm = get_nws_official(cfg['lat'], cfg['lon'], cfg['tz'])
         if n_t is not None or n_tm is not None:
             full_data.append({'Airport': code, 'Model': 'NWS Official', 'Today': n_t, 'Tomorrow': n_tm})
-        time.sleep(0.2) # <--- Pause for NWS API
+        time.sleep(0.2) 
         
         # --- 3. LAMP ---
         l_t, l_tm, l_h = get_lamp_data(cfg['station_id'], cfg['tz'])
         history[code] = l_h
         if l_t: full_data.append({'Airport': code, 'Model': 'LAMP', 'Today': l_t, 'Tomorrow': l_tm})
-        time.sleep(0.2) # <--- Pause for NWS LAMP
+        time.sleep(0.2) 
         
         # --- 4. GFS MOS ---
         mos_list = get_mos(cfg['station_id'], cfg['tz'])
@@ -650,20 +700,17 @@ if __name__ == "__main__":
             full_data.append({'Airport': code, 'Model': 'GFS MOS', 'Today': best['today'], 'Tomorrow': best['tmw']})
             for old_run in mos_list[1:3]:
                 full_data.append({'Airport': code, 'Model': f"GFS MOS (Prev {old_run['run_str']})", 'Today': old_run['today'], 'Tomorrow': old_run['tmw']})
-        time.sleep(0.2) # <--- Pause for NWS MOS
+        time.sleep(0.2) 
         
         # --- 5. Global Models (Open-Meteo) ---
         for name, m_code in GLOBAL_MODELS.items():
             g_t, g_tm = get_global_model(cfg['lat'], cfg['lon'], cfg['tz'], m_code)
             
             if g_t: 
-                # Add Current
                 full_data.append({'Airport': code, 'Model': name, 'Today': g_t, 'Tomorrow': g_tm})
                 
-                # Update History Log
                 model_hist = track_model_history(code, name, g_t, g_tm)
                 
-                # Add Previous 2 distinct runs
                 count = 0
                 for item in model_hist[1:]:
                     if count >= 2: break
@@ -675,7 +722,7 @@ if __name__ == "__main__":
                     })
                     count += 1
             
-            time.sleep(0.5) # <--- CRITICAL: Pause between Open-Meteo calls
+            time.sleep(0.5)
 
     # 2. Get Kalshi Data
     kalshi = get_kalshi()
