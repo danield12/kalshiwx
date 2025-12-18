@@ -5,6 +5,7 @@ import pickle
 import os
 import re
 import time
+import json
 import warnings
 from datetime import datetime, timedelta
 from io import StringIO
@@ -42,11 +43,11 @@ HUB_CONFIG = {
 }
 
 GLOBAL_MODELS = {
+    "HRRR": "gfs_hrrr",
     "ECMWF": "ecmwf_ifs025",
     "GFS": "gfs_global",
     "ICON": "icon_global",
-    "GEM": "gem_global",
-    "HRRR": "gfs_hrrr"
+    "GEM": "gem_global"
 }
 
 AIRPORT_WEATHER_FILES = ["airportswxpart1.txt", "airportswxpart2.txt"] 
@@ -160,6 +161,50 @@ def get_live_ml_prediction(hub_id):
 # ==============================================================================
 # 3. FORECASTING ENGINES
 # ==============================================================================
+def track_model_history(station_code, model_name, today_val, tmw_val):
+    """
+    Saves history for ANY model to a JSON file. 
+    Only saves a new entry if the values differ from the last saved entry 
+    (to avoid duplicates on frequent script runs).
+    """
+    if not os.path.exists("Kalshi"): os.makedirs("Kalshi")
+    file_path = f"Kalshi/{station_code}_{model_name}_log.json"
+    history = []
+    
+    # 1. Load existing
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, 'r') as f: history = json.load(f)
+        except: pass
+
+    # 2. Check if new data is different from the absolute latest entry
+    is_new = True
+    if history:
+        last = history[0]
+        # If values match exactly, assume it's the same run cycle (no update)
+        if last['today'] == today_val and last['tmw'] == tmw_val:
+            is_new = False
+            # Update timestamp to show it was verified recently? 
+            # No, keep original timestamp to show when that run FIRST appeared.
+
+    if is_new:
+        now_utc = datetime.now(pytz.utc)
+        new_entry = {
+            'ts': now_utc.strftime('%Y-%m-%d %H:%M'), # For debugging
+            'label': now_utc.strftime('%H:%M'),       # For display
+            'today': today_val, 
+            'tmw': tmw_val
+        }
+        history.insert(0, new_entry)
+        
+    # 3. Prune (Keep last 10, we only display top 2 but keep a buffer)
+    history = history[:10]
+    
+    # 4. Save
+    with open(file_path, 'w') as f: json.dump(history, f)
+    
+    return history
+
 def get_lamp_data(station, tz_str):
     history = []
     now_utc = datetime.now(pytz.utc)
@@ -168,7 +213,6 @@ def get_lamp_data(station, tz_str):
     local_now = datetime.now(tz)
     local_today = local_now.date()
     local_tomorrow = local_today + timedelta(days=1)
-    
     best_today, best_tmw = None, None
     
     def parse(text):
@@ -189,54 +233,40 @@ def get_lamp_data(station, tz_str):
         return None
 
     found_anchor = False
-    
     for i in range(18):
         check_hr = (now_utc.hour - i) % 24
         url = f"https://lamp.mdl.nws.noaa.gov/lamp/meteo/bullpop.php?sta={station}&forecast_time={check_hr:02d}"
-        
         try:
             r = requests.get(url, timeout=2)
             if r.status_code == 200 and "LAMP" in r.text:
                 text = r.text
                 header_date = extract_header_date(text)
-                
                 if not found_anchor:
-                    if header_date and header_date != now_utc.date():
-                        continue 
+                    if header_date and header_date != now_utc.date(): continue 
                     found_anchor = True
-                
                 if len(history) >= 12: break
-                
                 df = parse(text)
                 if df is not None:
                     vals = pd.to_numeric(df['TMP'], errors='coerce')
                     offset = 1 if (int(df['UTC'].iloc[0]) < check_hr) else 0
                     prev = -1
                     target_today, target_tmw = [], []
-                    
                     base_date = header_date if header_date else now_utc.date()
-                    
                     for h_str, t_val in zip(df['UTC'], vals):
                         h = int(h_str)
                         if prev == 23 and h == 0: offset += 1
-                        
                         dt_utc = datetime(base_date.year, base_date.month, base_date.day, h, 0, 0, tzinfo=pytz.utc) + timedelta(days=offset)
                         dt_local = dt_utc.astimezone(tz)
                         prev = h
-                        
                         if dt_local.hour in [13,14,15,16,17]: 
                             if dt_local.date() == local_today: target_today.append(t_val)
                             if dt_local.date() == local_tomorrow: target_tmw.append(t_val)
-                            
                     ht = max(target_today) if target_today else None
                     htm = max(target_tmw) if target_tmw else None
-                    
                     history.append({'Run': f"{check_hr:02d}z", 'Today': ht, 'Tmw': htm})
-                    
                     if best_today is None: best_today = ht
                     if best_tmw is None: best_tmw = htm
         except: pass
-        
     return best_today, best_tmw, history
 
 _MOS_CACHE = {}
@@ -244,10 +274,8 @@ def get_mos(station, tz_str):
     runs = ['18', '12', '06', '00']
     valid_runs = []
     
-    # 1. Collect all valid blocks
     for r in runs:
         url = f"https://www.weather.gov/source/mdl/MOS/GFSMAV.t{r}z"
-        # Cache logic
         if url not in _MOS_CACHE:
             try: 
                 resp = requests.get(url, timeout=2)
@@ -257,13 +285,10 @@ def get_mos(station, tz_str):
 
         text = _MOS_CACHE.get(url, "")
         if not text: continue
-        
-        # Regex to find station block
         match = re.search(rf"({station}\s+GFS.*?)(?=\n[A-Z]{{4}}|\Z)", text, re.DOTALL)
         if not match: continue
         block = match.group(1)
         
-        # Parse Date/Time from Header
         date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{4})\s+(\d{4})\s+UTC", block)
         if not date_match: continue
         
@@ -271,7 +296,6 @@ def get_mos(station, tz_str):
             dt_str = f"{date_match.group(1)} {date_match.group(2)}"
             run_dt = datetime.strptime(dt_str, "%m/%d/%Y %H%M").replace(tzinfo=pytz.utc)
             
-            # --- Parse Hourly Data for this block ---
             lines = block.split('\n')
             hr_line = next((l for l in lines if l.strip().startswith('HR')), None)
             tmp_line = next((l for l in lines if l.strip().startswith('TMP')), None)
@@ -295,28 +319,19 @@ def get_mos(station, tz_str):
 
                 local_today = datetime.now(pytz.timezone(tz_str)).date()
                 local_tmw = local_today + timedelta(days=1)
-                
                 today_temps = [d for d in data_points if d['date'] == local_today]
                 tmw_temps = [d for d in data_points if d['date'] == local_tmw]
 
                 t_high = None
                 if today_temps:
-                    # Only count as valid "Today" high if the run started before 2pm local
                     if today_temps[0]['hour'] <= 14: 
                         t_high = max(d['temp'] for d in today_temps)
                 
                 tm_high = max(d['temp'] for d in tmw_temps) if tmw_temps else None
                 
                 if t_high is not None or tm_high is not None:
-                    valid_runs.append({
-                        'run_str': f"{r}z",
-                        'dt': run_dt,
-                        'today': t_high,
-                        'tmw': tm_high
-                    })
+                    valid_runs.append({'run_str': f"{r}z", 'dt': run_dt, 'today': t_high, 'tmw': tm_high})
         except: continue
-
-    # Sort by datetime descending (Newest first)
     valid_runs.sort(key=lambda x: x['dt'], reverse=True)
     return valid_runs
 
@@ -404,16 +419,12 @@ def get_kalshi():
 # 4. WEIGHTED BLEND LOGIC
 # ==============================================================================
 def calculate_weighted_blend(city_rows):
-    """
-    Calculates a Weighted Average based on model hierarchy.
-    """
-    # WEIGHTS DEFINITION
     weights = {
-        'NWS Official': 5.0, # Settlement Source
-        'LAMP': 3.5,         # Tuned Guidance
-        'GFS MOS': 2.0,      # Statistical Guidance
-        'HRRR': 1.5,         # Hi-Res Short Term
-        'ECMWF': 1.0,        # Good Global
+        'NWS Official': 5.0, 
+        'LAMP': 3.5,         
+        'GFS MOS': 2.0,      
+        'HRRR': 1.5,         
+        'ECMWF': 1.0,        
         'GFS': 0.5,
         'GEM': 0.5,
         'ICON': 0.5
@@ -424,11 +435,7 @@ def calculate_weighted_blend(city_rows):
 
     for r in city_rows:
         model_name = r['Model']
-        
-        # --- NEW: Ignore older runs in the weighted average ---
-        if "Prev" in model_name: 
-            continue 
-        # -----------------------------------------------------
+        if "Prev" in model_name: continue # Ignore history in blend
 
         w = weights.get(model_name, 0.5) 
         
@@ -446,13 +453,10 @@ def calculate_weighted_blend(city_rows):
     return today_blend, tmw_blend
 
 def build_html(full_data, ml_preds, kalshi_df, history):
-    # --- NEW: Get Current Times ---
     now_utc = datetime.now(pytz.utc)
     now_est = now_utc.astimezone(pytz.timezone('US/Eastern'))
-    
     time_est_str = now_est.strftime('%Y-%m-%d %I:%M:%S %p %Z')
     time_utc_str = now_utc.strftime('%Y-%m-%d %H:%M:%S %Z')
-    # ------------------------------
 
     html = """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Weather Master V17</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
@@ -521,11 +525,9 @@ def build_html(full_data, ml_preds, kalshi_df, history):
         city_hist = history.get(code, [])
         k_all = kalshi_df[kalshi_df['Airport'] == code].copy() if not kalshi_df.empty else pd.DataFrame()
         
-        # Calculate Weighted Blend
         wb_today, wb_tmw = calculate_weighted_blend(city_rows)
         cons = wb_today if wb_today else 0
 
-        # Build Kalshi HTML
         def make_k_table(df_sub):
             if df_sub.empty: return "<tr><td colspan='3' class='text-center text-muted'>No Active Markets</td></tr>"
             df_sub = df_sub.sort_values('Low', ascending=True)
@@ -544,7 +546,6 @@ def build_html(full_data, ml_preds, kalshi_df, history):
         <div class="col-md-5"><div class="card"><div class="card-header">Forecast Models</div><table class="table table-dark table-sm mb-0">
         <thead><tr><th class="col-model" style="color:#fff !important">Model</th><th class="col-temp" style="color:#fff !important">Today High</th><th class="col-temp" style="color:#fff !important">Tom High</th></tr></thead><tbody>"""
         
-        # Add WEIGHTED BLEND Row First
         html += f"<tr class='blend-row'><td>WEIGHTED CONSENSUS</td><td class='text-center'>{wb_today:.1f}</td><td class='text-center'>{wb_tmw:.1f}</td></tr>"
         
         for r in city_rows: html += f"<tr><td>{r['Model']}</td><td class='text-center'>{r['Today']}</td><td class='text-center'>{r['Tomorrow']}</td></tr>"
@@ -584,32 +585,37 @@ if __name__ == "__main__":
         history[code] = l_h
         if l_t: full_data.append({'Airport': code, 'Model': 'LAMP', 'Today': l_t, 'Tomorrow': l_tm})
         
-        # --- MODIFIED GFS MOS LOGIC (Multi-Run) ---
+        # --- GFS MOS (Using Text Parsing History) ---
         mos_list = get_mos(cfg['station_id'], cfg['tz'])
-        
         if mos_list:
-            # 1. The Best/Freshest Run (Used for Math)
             best = mos_list[0]
-            full_data.append({
-                'Airport': code, 
-                'Model': 'GFS MOS', 
-                'Today': best['today'], 
-                'Tomorrow': best['tmw']
-            })
-            
-            # 2. Previous Runs (Display only, max 3)
-            for old_run in mos_list[1:4]:
-                full_data.append({
-                    'Airport': code, 
-                    'Model': f"GFS MOS (Prev {old_run['run_str']})", 
-                    'Today': old_run['today'], 
-                    'Tomorrow': old_run['tmw']
-                })
-        # ------------------------------------------
+            full_data.append({'Airport': code, 'Model': 'GFS MOS', 'Today': best['today'], 'Tomorrow': best['tmw']})
+            # Show last 2 previous runs
+            for old_run in mos_list[1:3]:
+                full_data.append({'Airport': code, 'Model': f"GFS MOS (Prev {old_run['run_str']})", 'Today': old_run['today'], 'Tomorrow': old_run['tmw']})
         
+        # --- GLOBAL MODELS (Using JSON History) ---
         for name, m_code in GLOBAL_MODELS.items():
             g_t, g_tm = get_global_model(cfg['lat'], cfg['lon'], cfg['tz'], m_code)
-            if g_t: full_data.append({'Airport': code, 'Model': name, 'Today': g_t, 'Tomorrow': g_tm})
+            if g_t: 
+                # 1. Add Current
+                full_data.append({'Airport': code, 'Model': name, 'Today': g_t, 'Tomorrow': g_tm})
+                
+                # 2. Update History Log
+                model_hist = track_model_history(code, name, g_t, g_tm)
+                
+                # 3. Add Previous 2 distinct runs (skipping index 0 which is current)
+                # We skip index 0 because we just added the "Current" row above.
+                count = 0
+                for item in model_hist[1:]:
+                    if count >= 2: break
+                    full_data.append({
+                        'Airport': code, 
+                        'Model': f"{name} (Prev {item['label']})", 
+                        'Today': item['today'], 
+                        'Tomorrow': item['tmw']
+                    })
+                    count += 1
 
     # 2. Get Kalshi Data
     kalshi = get_kalshi()
