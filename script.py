@@ -243,21 +243,64 @@ def get_lamp_data(station, tz_str):
 
 _MOS_CACHE = {}
 def get_mos(station):
-    hr = datetime.now(pytz.utc).hour
-    run = '12' if hr >= 14 else '06' if hr >= 8 else '00'
-    url = f"https://www.weather.gov/source/mdl/MOS/GFSMAV.t{run}z"
-    if url not in _MOS_CACHE:
-        try: _MOS_CACHE[url] = requests.get(url, timeout=5).text
-        except: return None, None
-    text = _MOS_CACHE[url]
-    match = re.search(rf"({station}.*?)(\n[A-Z]{{4}}|\Z)", text, re.DOTALL)
-    if not match: return None, None
-    block = match.group(1)
-    for line in block.split('\n'):
+    # 1. Define all possible run times (Reverse order isn't strictly necessary as we compare dates, but good for efficiency)
+    runs = ['18', '12', '06', '00']
+    
+    best_dt = None
+    best_block = None
+    
+    # 2. Loop through all runs to find the freshest data
+    for r in runs:
+        url = f"https://www.weather.gov/source/mdl/MOS/GFSMAV.t{r}z"
+        
+        # Fetch or use Cache
+        if url not in _MOS_CACHE:
+            try: 
+                response = requests.get(url, timeout=3)
+                if response.status_code == 200:
+                    _MOS_CACHE[url] = response.text
+                else:
+                    _MOS_CACHE[url] = "" # Cache failure as empty to avoid retries
+            except: 
+                continue
+
+        text = _MOS_CACHE.get(url, "")
+        if not text: continue
+
+        # 3. Find the station block
+        # Regex looks for Station ID followed by content until the next station header (4 chars) or End of String
+        match = re.search(rf"({station}.*?)(\n[A-Z]{{4}}|\Z)", text, re.DOTALL)
+        if not match: continue
+        
+        block = match.group(1)
+        
+        # 4. Extract Date/Time from the block to verify freshness
+        # Looks for line like: "KNYC   GFS MOS GUIDANCE   12/18/2025  1200 UTC"
+        date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{4})\s+(\d{4})\s+UTC", block)
+        
+        if date_match:
+            try:
+                dt_str = f"{date_match.group(1)} {date_match.group(2)}"
+                # Parse to datetime object (UTC)
+                current_dt = datetime.strptime(dt_str, "%m/%d/%Y %H%M").replace(tzinfo=pytz.utc)
+                
+                # Compare: Is this the newest one we've found so far?
+                if best_dt is None or current_dt > best_dt:
+                    best_dt = current_dt
+                    best_block = block
+            except:
+                continue
+
+    # 5. Parse the best block found
+    if not best_block: return None, None
+    
+    for line in best_block.split('\n'):
         if 'X/N' in line or 'N/X' in line:
+            # Clean string and extract numbers
             nums = [int(n) for n in re.findall(r'-?\d+', line.replace('X/N','').replace('N/X',''))]
             if len(nums) >= 3: return nums[0], nums[2]
             if len(nums) >= 2: return nums[0], nums[1]
+            
     return None, None
 
 def get_nws_official(lat, lon, tz_str):
@@ -539,4 +582,5 @@ if __name__ == "__main__":
         f.write(build_html(full_data, ml_preds, kalshi, history))
     
     print(f"SUCCESS: Dashboard saved to {output_path}")
+
 
