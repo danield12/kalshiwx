@@ -1,6 +1,0 @@
-pandas
-numpy
-requests
-scikit-learn
-pytz
-ipython
