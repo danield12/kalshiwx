@@ -20,7 +20,7 @@ warnings.filterwarnings("ignore")
 # ==============================================================================
 WUNDERGROUND_API_KEY = 'e1f10a1e78da46f5b10a1e78da96f525' 
 
-# --- NEW: WETHR API CREDENTIALS ---
+# --- WETHR API CREDENTIALS ---
 WETHR_API_KEY = '36a3796100f0453ebf5ee6c99f6ac5db5a314afd2bcdf9049fef1edca7b0d710'
 WETHR_API_BASE = 'https://wethr.net'
 
@@ -166,44 +166,31 @@ def get_live_ml_prediction(hub_id):
 # 3. FORECASTING ENGINES & DATA SOURCES
 # ==============================================================================
 def get_wethr_data(station_code):
-    """
-    Fetches data from the custom Wethr API.
-    Mode 1: Latest (Current Temp)
-    Mode 2: Wethr High (Trading Day High)
-    """
     latest_val = None
     high_val = None
     endpoint = f"{WETHR_API_BASE}/api/v1/observations.php"
-    
-    # Common auth param (adjust if API expects 'key' or 'token')
     auth = {"api_key": WETHR_API_KEY} 
 
-    # 1. Get Latest Observation
     try:
         params = {"station_code": station_code, "mode": "latest"}
         params.update(auth)
-        
         r = requests.get(endpoint, params=params, timeout=5)
         if r.status_code == 200:
             data = r.json() 
             if isinstance(data, dict):
                 latest_val = data.get('temp', data.get('temperature', data.get('value')))
-            else:
-                latest_val = float(data)
+            else: latest_val = float(data)
     except: pass
 
-    # 2. Get Wethr High
     try:
         params = {"station_code": station_code, "mode": "wethr_high"}
         params.update(auth)
-        
         r = requests.get(endpoint, params=params, timeout=5)
         if r.status_code == 200:
             data = r.json()
             if isinstance(data, dict):
                 high_val = data.get('high', data.get('value', data.get('temp')))
-            else:
-                high_val = float(data)
+            else: high_val = float(data)
     except: pass
     
     return latest_val, high_val
@@ -241,7 +228,6 @@ def track_model_history(station_code, model_name, today_val, tmw_val):
 def get_lamp_data(station, tz_str):
     history = []
     now_utc = datetime.now(pytz.utc)
-    
     tz = pytz.timezone(tz_str)
     local_now = datetime.now(tz)
     local_today = local_now.date()
@@ -303,12 +289,17 @@ def get_lamp_data(station, tz_str):
     return best_today, best_tmw, history
 
 _MOS_CACHE = {}
-def get_mos(station, tz_str):
+def get_mos_base(station, tz_str, model_type):
+    # Helper to scrape both GFS (MAV) and NAM (MET)
     runs = ['18', '12', '06', '00']
     valid_runs = []
     
+    # URL Pattern Switching
+    code_str = "GFS" if model_type == "GFS" else "NAM"
+    url_code = "GFSMAV" if model_type == "GFS" else "NAMMET"
+    
     for r in runs:
-        url = f"https://www.weather.gov/source/mdl/MOS/GFSMAV.t{r}z"
+        url = f"https://www.weather.gov/source/mdl/MOS/{url_code}.t{r}z"
         if url not in _MOS_CACHE:
             try: 
                 resp = requests.get(url, timeout=2)
@@ -318,7 +309,9 @@ def get_mos(station, tz_str):
 
         text = _MOS_CACHE.get(url, "")
         if not text: continue
-        match = re.search(rf"({station}\s+GFS.*?)(?=\n[A-Z]{{4}}|\Z)", text, re.DOTALL)
+        
+        # Regex (GFS vs NAM header)
+        match = re.search(rf"({station}\s+{code_str}.*?)(?=\n[A-Z]{{4}}|\Z)", text, re.DOTALL)
         if not match: continue
         block = match.group(1)
         
@@ -368,6 +361,94 @@ def get_mos(station, tz_str):
     valid_runs.sort(key=lambda x: x['dt'], reverse=True)
     return valid_runs
 
+def get_nbm_data(station, tz_str):
+    # NBM (National Blend) Scraper
+    try:
+        url = f"https://tgftp.nws.noaa.gov/data/forecasts/nbm/station/{station}.txt"
+        r = requests.get(url, timeout=3)
+        if r.status_code != 200: return None, None
+        
+        text = r.text
+        # Find start of data
+        lines = text.splitlines()
+        
+        # Parse timestamp from header (optional for freshness check)
+        # Parse data rows
+        utc_line = next((l for l in lines if "UTC" in l), None)
+        tmp_line = next((l for l in lines if "TMP" in l), None)
+        
+        if not utc_line or not tmp_line: return None, None
+        
+        # NBM formatting is fixed width, but splitting by space usually works if aligned
+        # The NBM text output usually has date lines like "DT 12/18"
+        # We need to find the "DT" line to anchor dates
+        dt_line = next((l for l in lines if l.strip().startswith("DT")), None)
+        
+        if not dt_line: return None, None
+        
+        # Parsing NBM text is complex due to varying column widths. 
+        # Strategy: Use index positions from UTC line
+        # UTC line: "UTC 06 07 08 ..."
+        # DT line:  "DT  12/18 ..."
+        
+        # Simplify: Just extract all numbers and align them
+        # Note: This simple method assumes 1-hour intervals. 
+        # NBM text is usually hourly for first 24-36h.
+        
+        hours = []
+        temps = []
+        
+        # Extract hours from UTC line (skipping 'UTC' label)
+        # Be careful of 3-digit hours or weird spacing
+        hours = [int(x) for x in utc_line.replace("UTC","").split()]
+        
+        # Extract temps from TMP line
+        temps = [int(x) for x in tmp_line.replace("TMP","").split()]
+        
+        # Extract Dates from DT line
+        # Format: "DT  12/18  12/19" - spans many columns
+        # This is hard to robustly parse with simple split. 
+        # Alternative: Reconstruct timeline from Current UTC + Hours
+        
+        # Find Model Run Time from first line: "KNYC   NBM V4.1   12/18/2025  1500 UTC"
+        header_match = re.search(r'(\d{1,2}/\d{1,2}/\d{4})\s+(\d{4})\s+UTC', lines[0])
+        if not header_match: return None, None
+        
+        run_dt = datetime.strptime(f"{header_match.group(1)} {header_match.group(2)}", "%m/%d/%Y %H%M").replace(tzinfo=pytz.utc)
+        
+        curr_date = run_dt.date()
+        run_hour = run_dt.hour
+        
+        # Align start
+        # If first data hour < run hour, it's next day? No, NBM usually starts near run time.
+        # But NBM text usually lists past hours too? No, usually forecast only.
+        if hours[0] < run_hour: curr_date += timedelta(days=1)
+        
+        data_points = []
+        prev_h = -1
+        
+        for h, t in zip(hours, temps):
+            if h < prev_h: curr_date += timedelta(days=1)
+            dt_utc = datetime(curr_date.year, curr_date.month, curr_date.day, h, 0, 0, tzinfo=pytz.utc)
+            dt_local = dt_utc.astimezone(pytz.timezone(tz_str))
+            data_points.append({'date': dt_local.date(), 'hour': dt_local.hour, 'temp': t})
+            prev_h = h
+            
+        local_today = datetime.now(pytz.timezone(tz_str)).date()
+        local_tmw = local_today + timedelta(days=1)
+        today_temps = [d for d in data_points if d['date'] == local_today]
+        tmw_temps = [d for d in data_points if d['date'] == local_tmw]
+
+        t_high = None
+        if today_temps:
+            if today_temps[0]['hour'] <= 14: 
+                t_high = max(d['temp'] for d in today_temps)
+        
+        tm_high = max(d['temp'] for d in tmw_temps) if tmw_temps else None
+        
+        return t_high, tm_high
+    except: return None, None
+
 def get_nws_official(lat, lon, tz_str):
     try:
         r = requests.get(f"https://api.weather.gov/points/{lat},{lon}", headers={'User-Agent':'myapp'}, timeout=3)
@@ -389,46 +470,30 @@ def get_nws_official(lat, lon, tz_str):
     except: return None, None
 
 def get_global_model(lat, lon, tz, model_code):
-    # Try up to 3 times
     for attempt in range(3):
         try:
             url = "https://api.open-meteo.com/v1/forecast"
             params = {
-                "latitude": lat, 
-                "longitude": lon, 
-                "hourly": "temperature_2m", 
-                "timezone": tz, 
-                "forecast_days": 3, 
-                "models": model_code
+                "latitude": lat, "longitude": lon, "hourly": "temperature_2m", 
+                "timezone": tz, "forecast_days": 3, "models": model_code
             }
-            
-            # INCREASED TIMEOUT to 10 seconds
             r = requests.get(url, params=params, timeout=10)
-            
             if r.status_code == 200:
                 data = r.json().get('hourly')
                 if not data: return None, None
-                
                 df = pd.DataFrame({'time': data['time'], 'temp': data['temperature_2m']})
                 df['dt'] = pd.to_datetime(df['time'])
                 df['date'] = df['dt'].dt.date
-                
                 today = datetime.now(pytz.timezone(tz)).date()
                 tmw = today + timedelta(days=1)
-                
                 t1 = df[df['date'] == today]['temp'].max()
                 t2 = df[df['date'] == tmw]['temp'].max()
-                
                 if not pd.isna(t1): t1 = (t1 * 9/5) + 32
                 if not pd.isna(t2): t2 = (t2 * 9/5) + 32
-                
                 return round(t1, 1), round(t2, 1)
-                
         except:
-            # If it fails, wait 2 seconds and try again
             time.sleep(2)
             continue
-            
     return None, None
 
 def get_kalshi():
@@ -438,9 +503,8 @@ def get_kalshi():
     tmw_code = (datetime.now() + timedelta(days=1)).strftime("%y%b%d").upper()
     data = []
     kalshi_map = {v['kalshi']: k for k, v in LOCATIONS.items()}
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    headers = {"User-Agent": "Mozilla/5.0"}
 
-    # 1. Fetch Raw Data
     for kt, city in kalshi_map.items():
         try:
             r = requests.get(url, params={"series_ticker": kt, "status": "open"}, headers=headers, timeout=5)
@@ -449,28 +513,19 @@ def get_kalshi():
                     day_type = None
                     if today_code in m['ticker']: day_type = 'Today'
                     elif tmw_code in m['ticker']: day_type = 'Tomorrow'
-                    
                     if day_type:
                         sub = m.get('subtitle','')
                         last_part = m['ticker'].split('-')[-1]
-                        
-                        # Extract the numeric value (strike price)
                         s_val = 0
                         s_val_match = re.search(r'([\d.]+)', last_part)
-                        if s_val_match:
-                            s_val = float(s_val_match.group(1))
+                        if s_val_match: s_val = float(s_val_match.group(1))
                         
-                        # Default assumption: It's a 1-degree band
                         low, high = s_val, s_val + 0.9
-                        
-                        # Detect if it's a specific band (B) or Threshold (T)
-                        # We will refine 'Threshold' logic in the 2nd pass below
                         if not sub:
                             s_type = 'B' if 'B' in last_part else 'T'
                             if s_type == 'B': sub = f"{int(s_val)}° to {int(s_val)+1}°"
                             else: sub = f"Threshold {s_val}°"
 
-                        # Handle explicit API text if present
                         if 'below' in sub.lower() or 'less' in sub.lower(): high = s_val; low = -999
                         elif 'above' in sub.lower() or 'greater' in sub.lower(): low = s_val; high = 999
                         elif 'to' in sub:
@@ -479,41 +534,24 @@ def get_kalshi():
                                     low, high = float(parts[0]), float(parts[1])
                                 except: pass
                                 
-                        data.append({
-                            'Airport': city, 
-                            'Range': sub, 
-                            'Price': m['yes_bid'], 
-                            'Low': low, 
-                            'High': high, 
-                            'Day': day_type,
-                            'Strike': s_val # Keep for sorting
-                        })
+                        data.append({'Airport': city, 'Range': sub, 'Price': m['yes_bid'], 'Low': low, 'High': high, 'Day': day_type, 'Strike': s_val})
                 except: continue
         except: pass
         
-    # 2. Post-Processing: Fix the Tails (Lowest = Below, Highest = Above)
     df = pd.DataFrame(data)
     if not df.empty:
-        # We need to iterate over each City + Day group to find the min/max strike
         for (city, day), group in df.groupby(['Airport', 'Day']):
             if group.empty: continue
-            
             min_strike = group['Strike'].min()
             max_strike = group['Strike'].max()
             
-            # Update the Lowest Threshold
-            # If the row has the min_strike and "Threshold" in name, convert to "Below"
             mask_min = (df['Airport'] == city) & (df['Day'] == day) & (df['Strike'] == min_strike) & (df['Range'].str.contains('Threshold'))
             df.loc[mask_min, 'Range'] = f"{int(min_strike)}° and Below"
-            df.loc[mask_min, 'Low'] = -999
-            df.loc[mask_min, 'High'] = min_strike
+            df.loc[mask_min, 'Low'] = -999; df.loc[mask_min, 'High'] = min_strike
             
-            # Update the Highest Threshold
             mask_max = (df['Airport'] == city) & (df['Day'] == day) & (df['Strike'] == max_strike) & (df['Range'].str.contains('Threshold'))
             df.loc[mask_max, 'Range'] = f"{int(max_strike)}° and Above"
-            df.loc[mask_max, 'Low'] = max_strike
-            df.loc[mask_max, 'High'] = 999
-
+            df.loc[mask_max, 'Low'] = max_strike; df.loc[mask_max, 'High'] = 999
     return df
 
 # ==============================================================================
@@ -522,8 +560,10 @@ def get_kalshi():
 def calculate_weighted_blend(city_rows):
     weights = {
         'NWS Official': 5.0, 
+        'NBM': 4.0,           # NEW: High weight for National Blend
         'LAMP': 3.5,         
         'GFS MOS': 2.0,      
+        'NAM MOS': 2.0,       # NEW: Moderate weight
         'HRRR': 1.5,         
         'ECMWF': 1.0,        
         'GFS': 0.5,
@@ -536,8 +576,8 @@ def calculate_weighted_blend(city_rows):
 
     for r in city_rows:
         model_name = r['Model']
-        if "Prev" in model_name: continue # Ignore history in blend
-        if "Wethr" in model_name: continue # Ignore 'Truth' API in blend
+        if "Prev" in model_name: continue
+        if "Wethr" in model_name: continue
 
         w = weights.get(model_name, 0.5) 
         
@@ -551,7 +591,6 @@ def calculate_weighted_blend(city_rows):
             
     today_blend = t1_sum / t1_w_sum if t1_w_sum > 0 else None
     tmw_blend = t2_sum / t2_w_sum if t2_w_sum > 0 else None
-    
     return today_blend, tmw_blend
 
 def build_html(full_data, ml_preds, kalshi_df, history):
@@ -568,17 +607,11 @@ def build_html(full_data, ml_preds, kalshi_df, history):
         var tmw = document.getElementById(city + '-tmw');
         var btn = document.getElementById(city + '-btn');
         if (today.style.display === 'none') {
-            today.style.display = 'table-row-group'; 
-            tmw.style.display = 'none'; 
-            btn.innerText = 'Show Tomorrow';
-            btn.classList.remove('btn-cyan');
-            btn.classList.add('btn-outline-light');
+            today.style.display = 'table-row-group'; tmw.style.display = 'none'; btn.innerText = 'Show Tomorrow';
+            btn.classList.remove('btn-cyan'); btn.classList.add('btn-outline-light');
         } else {
-            today.style.display = 'none'; 
-            tmw.style.display = 'table-row-group'; 
-            btn.innerText = 'Show Today';
-            btn.classList.remove('btn-outline-light');
-            btn.classList.add('btn-cyan');
+            today.style.display = 'none'; tmw.style.display = 'table-row-group'; btn.innerText = 'Show Today';
+            btn.classList.remove('btn-outline-light'); btn.classList.add('btn-cyan');
         }
     }
     </script>
@@ -587,15 +620,7 @@ def build_html(full_data, ml_preds, kalshi_df, history):
         .card { background:#1e293b; border:1px solid #334155; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); border-radius: 8px; } 
         .card-header { background:#334155; border-bottom: 1px solid #475569; font-weight: 600; color: #e2e8f0; }
         .table { color:#e2e8f0; font-size:0.85rem; width: 100%; table-layout: fixed; margin-bottom: 0; } 
-        .table thead th { 
-            color: #ffffff !important; 
-            background-color: #0f172a !important; 
-            border-bottom: 2px solid #64748b; 
-            vertical-align: middle; 
-            text-transform: uppercase;
-            font-size: 0.75rem;
-            letter-spacing: 0.5px;
-        }
+        .table thead th { color: #ffffff !important; background-color: #0f172a !important; border-bottom: 2px solid #64748b; vertical-align: middle; text-transform: uppercase; font-size: 0.75rem; letter-spacing: 0.5px; }
         .table-striped tbody tr:nth-of-type(odd) { background-color: rgba(255,255,255,0.03); }
         .table td { border-color: #334155; vertical-align: middle; }
         .badge-ml { background:#0ea5e9; color: white; font-size: 0.9rem; }
@@ -629,7 +654,6 @@ def build_html(full_data, ml_preds, kalshi_df, history):
         
         wb_today, wb_tmw = calculate_weighted_blend(city_rows)
 
-        # --- KALSHI VALUE SCORING ---
         def calculate_market_value(r, current_forecasts):
             day_col = 'Today' if r['Day'] == 'Today' else 'Tomorrow'
             score = 0
@@ -642,13 +666,12 @@ def build_html(full_data, ml_preds, kalshi_df, history):
                 temp = f[day_col]
                 if temp is None: continue
                 
-                # Check distance (0 if in range, else distance to boundary)
                 dist = 0
                 if temp < r['Low']: dist = r['Low'] - temp
                 elif temp > r['High']: dist = temp - r['High']
                 
-                # Rules
-                if model in ['LAMP', 'HRRR', 'GFS MOS']:
+                # --- UPDATED SCORING RULES ---
+                if model in ['LAMP', 'HRRR', 'GFS MOS', 'NAM MOS', 'NBM']: # Added NAM & NBM here
                     total_possible += 5
                     if dist == 0: score += 5
                     elif dist <= 1.01: score += 3 
@@ -663,10 +686,8 @@ def build_html(full_data, ml_preds, kalshi_df, history):
                     elif dist <= 1.01: score += 0.5
             
             if total_possible == 0: return -r['Price']
-            
             probability = (score / total_possible) * 100
             return probability - r['Price']
-        # ---------------------------------------
 
         def make_k_table(df_sub):
             if df_sub.empty: return "<tr><td colspan='3' class='text-center text-muted'>No Active Markets</td></tr>"
@@ -715,7 +736,7 @@ if __name__ == "__main__":
     for code, cfg in LOCATIONS.items():
         print(f"Processing {code}...")
         
-        # --- 0. Wethr API (Custom) ---
+        # --- 0. Wethr API ---
         w_live, w_high = get_wethr_data(cfg['station_id'])
         if w_live is not None or w_high is not None:
              full_data.append({'Airport': code, 'Model': f"Wethr (Live {w_live})", 'Today': w_high, 'Tomorrow': None})
@@ -737,14 +758,29 @@ if __name__ == "__main__":
         time.sleep(0.2) 
         
         # --- 4. GFS MOS ---
-        mos_list = get_mos(cfg['station_id'], cfg['tz'])
+        mos_list = get_mos_base(cfg['station_id'], cfg['tz'], "GFS")
         if mos_list:
             best = mos_list[0]
             full_data.append({'Airport': code, 'Model': 'GFS MOS', 'Today': best['today'], 'Tomorrow': best['tmw']})
             for old_run in mos_list[1:3]:
                 full_data.append({'Airport': code, 'Model': f"GFS MOS (Prev {old_run['run_str']})", 'Today': old_run['today'], 'Tomorrow': old_run['tmw']})
         time.sleep(0.2) 
-        
+
+        # --- NEW: NAM MOS ---
+        nam_list = get_mos_base(cfg['station_id'], cfg['tz'], "NAM")
+        if nam_list:
+            best = nam_list[0]
+            full_data.append({'Airport': code, 'Model': 'NAM MOS', 'Today': best['today'], 'Tomorrow': best['tmw']})
+            for old_run in nam_list[1:3]:
+                full_data.append({'Airport': code, 'Model': f"NAM MOS (Prev {old_run['run_str']})", 'Today': old_run['today'], 'Tomorrow': old_run['tmw']})
+        time.sleep(0.2)
+
+        # --- NEW: NBM (National Blend) ---
+        nbm_t, nbm_tm = get_nbm_data(cfg['station_id'], cfg['tz'])
+        if nbm_t is not None:
+             full_data.append({'Airport': code, 'Model': 'NBM', 'Today': nbm_t, 'Tomorrow': nbm_tm})
+        time.sleep(0.2)
+
         # --- 5. Global Models (Open-Meteo) ---
         for name, m_code in GLOBAL_MODELS.items():
             g_t, g_tm = get_global_model(cfg['lat'], cfg['lon'], cfg['tz'], m_code)
@@ -781,4 +817,3 @@ if __name__ == "__main__":
         f.write(build_html(full_data, ml_preds, kalshi, history))
     
     print(f"SUCCESS: Dashboard saved to {output_path}")
-
