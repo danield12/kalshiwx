@@ -456,7 +456,7 @@ def get_nws_official(lat, lon, tz_str):
     except: return None, None
 
 def get_global_model(lat, lon, tz, model_code):
-    for attempt in range(3):
+    for attempt in range(4):
         try:
             url = "https://api.open-meteo.com/v1/forecast"
             params = {
@@ -478,7 +478,7 @@ def get_global_model(lat, lon, tz, model_code):
                 if not pd.isna(t2): t2 = (t2 * 9/5) + 32
                 return round(t1, 1), round(t2, 1)
         except:
-            time.sleep(2)
+            time.sleep(10)
             continue
     return None, None
 
@@ -848,3 +848,4 @@ if __name__ == "__main__":
         f.write(build_html(full_data, ml_preds, kalshi, history, wethr_stats))
     
     print(f"SUCCESS: Dashboard saved to {output_path}")
+
