@@ -166,20 +166,15 @@ def get_live_ml_prediction(hub_id):
 # 3. FORECASTING ENGINES & DATA SOURCES
 # ==============================================================================
 def get_wethr_data(station_code):
-    """
-    Fetches Latest (C converted to F) and Wethr High (F).
-    """
     latest_f = None
     high_f = None
     endpoint = f"{WETHR_API_BASE}/api/v1/observations.php"
     
-    # Corrected Headers (Bearer Token)
     headers = {
         "Authorization": f"Bearer {WETHR_API_KEY}",
         "Accept": "application/json"
     }
 
-    # 1. Get Latest Observation (Convert C to F)
     try:
         params = {"station_code": station_code, "mode": "latest"}
         r = requests.get(endpoint, headers=headers, params=params, timeout=5)
@@ -190,7 +185,6 @@ def get_wethr_data(station_code):
                 latest_f = (float(temp_c) * 1.8) + 32
     except: pass
 
-    # 2. Get Wethr High (Already F)
     try:
         params = {"station_code": station_code, "mode": "wethr_high"}
         r = requests.get(endpoint, headers=headers, params=params, timeout=5)
@@ -240,6 +234,11 @@ def get_lamp_data(station, tz_str):
     local_tomorrow = local_today + timedelta(days=1)
     best_today, best_tmw = None, None
     
+    # --- FIX 1: Add Headers for NWS ---
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+    
     def parse(text):
         lines = text.split('\n')
         utc, tmp = [], []
@@ -262,7 +261,8 @@ def get_lamp_data(station, tz_str):
         check_hr = (now_utc.hour - i) % 24
         url = f"https://lamp.mdl.nws.noaa.gov/lamp/meteo/bullpop.php?sta={station}&forecast_time={check_hr:02d}"
         try:
-            r = requests.get(url, timeout=2)
+            # --- FIX 1 Applied here: pass headers ---
+            r = requests.get(url, headers=headers, timeout=2)
             if r.status_code == 200 and "LAMP" in r.text:
                 text = r.text
                 header_date = extract_header_date(text)
@@ -296,11 +296,9 @@ def get_lamp_data(station, tz_str):
 
 _MOS_CACHE = {}
 def get_mos_base(station, tz_str, model_type):
-    # Helper to scrape both GFS (MAV) and NAM (MET)
     runs = ['18', '12', '06', '00']
     valid_runs = []
     
-    # URL Pattern Switching
     code_str = "GFS" if model_type == "GFS" else "NAM"
     url_code = "GFSMAV" if model_type == "GFS" else "NAMMET"
     
@@ -316,7 +314,6 @@ def get_mos_base(station, tz_str, model_type):
         text = _MOS_CACHE.get(url, "")
         if not text: continue
         
-        # Regex (GFS vs NAM header)
         match = re.search(rf"({station}\s+{code_str}.*?)(?=\n[A-Z]{{4}}|\Z)", text, re.DOTALL)
         if not match: continue
         block = match.group(1)
@@ -468,8 +465,13 @@ def get_global_model(lat, lon, tz, model_code):
 def get_kalshi():
     print("\n--- Fetching Kalshi Markets ---")
     url = "https://api.elections.kalshi.com/trade-api/v2/markets"
-    today_code = datetime.now().strftime("%y%b%d").upper()
-    tmw_code = (datetime.now() + timedelta(days=1)).strftime("%y%b%d").upper()
+    
+    # --- FIX 2: Use ET for ticker dates (Contracts are US-based) ---
+    et_tz = pytz.timezone("US/Eastern")
+    now_et = datetime.now(et_tz)
+    today_code = now_et.strftime("%y%b%d").upper()
+    tmw_code = (now_et + timedelta(days=1)).strftime("%y%b%d").upper()
+    
     data = []
     kalshi_map = {v['kalshi']: k for k, v in LOCATIONS.items()}
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -547,7 +549,7 @@ def calculate_weighted_blend(city_rows):
         model_name = r['Model']
         if "Prev" in model_name: continue
         
-        # Exclude Wethr from weighted blend as requested
+        # Exclude Wethr from weighted blend
         if "Wethr" in model_name: continue
 
         w = weights.get(model_name, 0.5) 
