@@ -228,13 +228,16 @@ def track_model_history(station_code, model_name, today_val, tmw_val):
 def get_lamp_data(station, tz_str):
     history = []
     now_utc = datetime.now(pytz.utc)
-    
     tz = pytz.timezone(tz_str)
     local_now = datetime.now(tz)
     local_today = local_now.date()
     local_tomorrow = local_today + timedelta(days=1)
-    
     best_today, best_tmw = None, None
+    
+    # Headers to prevent NWS blocking
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
     
     def parse(text):
         lines = text.split('\n')
@@ -260,13 +263,13 @@ def get_lamp_data(station, tz_str):
         url = f"https://lamp.mdl.nws.noaa.gov/lamp/meteo/bullpop.php?sta={station}&forecast_time={check_hr:02d}"
         
         try:
-            r = requests.get(url, timeout=2)
+            r = requests.get(url, headers=headers, timeout=2)
             if r.status_code == 200 and "LAMP" in r.text:
                 text = r.text
                 header_date = extract_header_date(text)
                 
                 if not found_anchor:
-                    if header_date and header_date != now_utc.date():
+                    if header_date and header_date != now_utc.date(): 
                         continue 
                     found_anchor = True
                 
@@ -289,9 +292,10 @@ def get_lamp_data(station, tz_str):
                         dt_local = dt_utc.astimezone(tz)
                         prev = h
                         
-                        if dt_local.hour in [13,14,15,16,17]: 
-                            if dt_local.date() == local_today: target_today.append(t_val)
-                            if dt_local.date() == local_tomorrow: target_tmw.append(t_val)
+                        # --- FIX: REMOVED HOUR FILTER ---
+                        # Checks strictly by local calendar date (Midnight to Midnight)
+                        if dt_local.date() == local_today: target_today.append(t_val)
+                        if dt_local.date() == local_tomorrow: target_tmw.append(t_val)
                             
                     ht = max(target_today) if target_today else None
                     htm = max(target_tmw) if target_tmw else None
@@ -815,4 +819,5 @@ if __name__ == "__main__":
         f.write(build_html(full_data, ml_preds, kalshi, history, wethr_stats))
     
     print(f"SUCCESS: Dashboard saved to {output_path}")
+
 
