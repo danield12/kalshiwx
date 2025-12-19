@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from io import StringIO
 from sklearn.ensemble import HistGradientBoostingRegressor
 import pytz
+from scipy.stats import norm  # <--- NEW IMPORT FOR PROBABILITY
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
@@ -196,11 +197,6 @@ def get_wethr_data(station_code):
     return latest_f, high_f
 
 def track_model_history(station_code, model_name, today_val, tmw_val, tz_str):
-    """
-    Manages history for models. 
-    1. Ensures we only keep history relevant to the CURRENT local date.
-    2. Stores at most the current run + 2 previous distinct runs.
-    """
     if not os.path.exists("Kalshi"): os.makedirs("Kalshi")
     file_path = f"Kalshi/{station_code}_{model_name}_log.json"
     history = []
@@ -210,16 +206,12 @@ def track_model_history(station_code, model_name, today_val, tmw_val, tz_str):
             with open(file_path, 'r') as f: history = json.load(f)
         except: pass
 
-    # Get local date to flush old history
     tz = pytz.timezone(tz_str)
     local_now = datetime.now(tz)
     local_date_str = local_now.strftime('%Y-%m-%d')
     
-    # Filter history: Keep only entries that belong to TODAY's date
-    # (assuming we added a 'date' field, if not, we rely on 'ts' but this is safer)
     valid_history = [h for h in history if h.get('date_str') == local_date_str]
     
-    # Check if new value is distinct from the most recent valid entry
     is_new = True
     if valid_history:
         last = valid_history[0]
@@ -231,13 +223,12 @@ def track_model_history(station_code, model_name, today_val, tmw_val, tz_str):
         new_entry = {
             'ts': now_utc.strftime('%Y-%m-%d %H:%M'), 
             'label': now_utc.strftime('%H:%M'),
-            'date_str': local_date_str, # Store local date to filter against later
+            'date_str': local_date_str, 
             'today': today_val, 
             'tmw': tmw_val
         }
         valid_history.insert(0, new_entry)
         
-    # Keep only top 3 (Current + 2 previous)
     valid_history = valid_history[:3]
     
     with open(file_path, 'w') as f: json.dump(valid_history, f)
@@ -252,7 +243,6 @@ def get_lamp_data(station, tz_str):
     local_tomorrow = local_today + timedelta(days=1)
     best_today, best_tmw = None, None
     
-    # Headers to prevent NWS blocking
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
@@ -310,8 +300,6 @@ def get_lamp_data(station, tz_str):
                         dt_local = dt_utc.astimezone(tz)
                         prev = h
                         
-                        # --- FIX: REMOVED HOUR FILTER ---
-                        # Checks strictly by local calendar date (Midnight to Midnight)
                         if dt_local.date() == local_today: target_today.append(t_val)
                         if dt_local.date() == local_tomorrow: target_tmw.append(t_val)
                             
@@ -669,46 +657,60 @@ def build_html(full_data, ml_preds, kalshi_df, history, wethr_stats):
         wb_today, wb_tmw = calculate_weighted_blend(city_rows)
 
         def calculate_market_value(r, current_forecasts):
+            # 1. Get Weighted Mean (Consensus)
             day_col = 'Today' if r['Day'] == 'Today' else 'Tomorrow'
-            score = 0
-            total_possible = 0
             
-            # --- NEW: Check against Wethr High Buster Logic ---
-            # If checking TODAY, and we have a valid High already:
+            # --- WETHR HIGH BUSTER CHECK ---
             if r['Day'] == 'Today' and w_high is not None and isinstance(w_high, (int, float)):
-                # If current high is already > Range High (busted)
-                # AND it is NOT an "Above" bucket (High=999)
+                # If confirmed high > Range High (busted) AND not the "Above" bucket
                 if w_high > r['High'] and r['High'] != 999:
-                    return 0 # Invalid contract, already busted
+                    return 0 # Already busted
             
+            temps = []
+            weights = []
+            
+            # Use same weights as main consensus
+            model_weights = {
+                'NWS Official': 5.0, 'NBM': 4.0, 'LAMP': 3.5, 
+                'GFS MOS': 2.0, 'NAM MOS': 2.0, 'HRRR': 1.5, 
+                'ECMWF': 1.0, 'GFS': 0.5, 'GEM': 0.5, 'ICON': 0.5
+            }
+
             for f in current_forecasts:
-                model = f['Model']
-                if "Prev" in model or "Wethr" in model: continue 
-                
-                temp = f[day_col]
-                if temp is None: continue
-                
-                dist = 0
-                if temp < r['Low']: dist = r['Low'] - temp
-                elif temp > r['High']: dist = temp - r['High']
-                
-                if model in ['LAMP', 'HRRR', 'GFS MOS', 'NAM MOS', 'NBM']: 
-                    total_possible += 5
-                    if dist == 0: score += 5
-                    elif dist <= 1.01: score += 3 
-                    elif dist <= 2.01: score += 1
-                elif model == 'NWS Official':
-                    total_possible += 3
-                    if dist == 0: score += 3
-                    elif dist <= 1.01: score += 1
-                elif model in ['ECMWF', 'GFS', 'ICON', 'GEM']:
-                    total_possible += 1
-                    if dist == 0: score += 1
-                    elif dist <= 1.01: score += 0.5
+                m_name = f['Model']
+                if "Prev" in m_name or "Wethr" in m_name: continue
+                val = f[day_col]
+                if val is not None:
+                    temps.append(val)
+                    weights.append(model_weights.get(m_name, 0.5))
+                    
+            if not temps: return -r['Price']
+
+            # Weighted Mean
+            mean_temp = np.average(temps, weights=weights)
             
-            if total_possible == 0: return -r['Price']
-            probability = (score / total_possible) * 100
-            return probability - r['Price']
+            # 2. Add Bias Correction (The "Blip" Factor)
+            # Models under-predict daily highs by ~1.2F on average due to hourly smoothing
+            mean_temp += 1.2
+            
+            # 3. Calculate Uncertainty (Sigma)
+            # Base uncertainty + model disagreement
+            base_sigma = 1.5 if r['Day'] == 'Today' else 2.5
+            model_spread_std = np.std(temps) if len(temps) > 1 else 0
+            sigma = base_sigma + (model_spread_std * 0.5)
+
+            # 4. Calculate Win Probability (Gaussian CDF)
+            low_bound = r['Low']
+            high_bound = r['High']
+            
+            if low_bound == -999: low_bound = -float('inf')
+            if high_bound == 999: high_bound = float('inf')
+
+            prob_win = norm.cdf(high_bound, loc=mean_temp, scale=sigma) - \
+                       norm.cdf(low_bound, loc=mean_temp, scale=sigma)
+            
+            fair_price = prob_win * 100
+            return fair_price - r['Price']
 
         def make_k_table(df_sub):
             if df_sub.empty: return "<tr><td colspan='3' class='text-center text-muted'>No Active Markets</td></tr>"
