@@ -228,16 +228,13 @@ def track_model_history(station_code, model_name, today_val, tmw_val):
 def get_lamp_data(station, tz_str):
     history = []
     now_utc = datetime.now(pytz.utc)
+    
     tz = pytz.timezone(tz_str)
     local_now = datetime.now(tz)
     local_today = local_now.date()
     local_tomorrow = local_today + timedelta(days=1)
-    best_today, best_tmw = None, None
     
-    # --- FIX 1: Add Headers for NWS ---
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    }
+    best_today, best_tmw = None, None
     
     def parse(text):
         lines = text.split('\n')
@@ -257,41 +254,54 @@ def get_lamp_data(station, tz_str):
         return None
 
     found_anchor = False
+    
     for i in range(18):
         check_hr = (now_utc.hour - i) % 24
         url = f"https://lamp.mdl.nws.noaa.gov/lamp/meteo/bullpop.php?sta={station}&forecast_time={check_hr:02d}"
+        
         try:
-            # --- FIX 1 Applied here: pass headers ---
-            r = requests.get(url, headers=headers, timeout=2)
+            r = requests.get(url, timeout=2)
             if r.status_code == 200 and "LAMP" in r.text:
                 text = r.text
                 header_date = extract_header_date(text)
+                
                 if not found_anchor:
-                    if header_date and header_date != now_utc.date(): continue 
+                    if header_date and header_date != now_utc.date():
+                        continue 
                     found_anchor = True
+                
                 if len(history) >= 12: break
+                
                 df = parse(text)
                 if df is not None:
                     vals = pd.to_numeric(df['TMP'], errors='coerce')
                     offset = 1 if (int(df['UTC'].iloc[0]) < check_hr) else 0
                     prev = -1
                     target_today, target_tmw = [], []
+                    
                     base_date = header_date if header_date else now_utc.date()
+                    
                     for h_str, t_val in zip(df['UTC'], vals):
                         h = int(h_str)
                         if prev == 23 and h == 0: offset += 1
+                        
                         dt_utc = datetime(base_date.year, base_date.month, base_date.day, h, 0, 0, tzinfo=pytz.utc) + timedelta(days=offset)
                         dt_local = dt_utc.astimezone(tz)
                         prev = h
+                        
                         if dt_local.hour in [13,14,15,16,17]: 
                             if dt_local.date() == local_today: target_today.append(t_val)
                             if dt_local.date() == local_tomorrow: target_tmw.append(t_val)
+                            
                     ht = max(target_today) if target_today else None
                     htm = max(target_tmw) if target_tmw else None
+                    
                     history.append({'Run': f"{check_hr:02d}z", 'Today': ht, 'Tmw': htm})
+                    
                     if best_today is None: best_today = ht
                     if best_tmw is None: best_tmw = htm
         except: pass
+        
     return best_today, best_tmw, history
 
 _MOS_CACHE = {}
@@ -805,3 +815,4 @@ if __name__ == "__main__":
         f.write(build_html(full_data, ml_preds, kalshi, history, wethr_stats))
     
     print(f"SUCCESS: Dashboard saved to {output_path}")
+
