@@ -167,44 +167,39 @@ def get_live_ml_prediction(hub_id):
 # ==============================================================================
 def get_wethr_data(station_code):
     """
-    Fetches data from Wethr API using Header Authentication.
+    Fetches Latest (C converted to F) and Wethr High (F).
     """
-    latest_val = None
-    high_val = None
+    latest_f = None
+    high_f = None
     endpoint = f"{WETHR_API_BASE}/api/v1/observations.php"
     
-    # --- CORRECTED AUTH: Header Only ---
+    # Corrected Headers (Bearer Token)
     headers = {
-        "X-API-Key": WETHR_API_KEY,
+        "Authorization": f"Bearer {WETHR_API_KEY}",
         "Accept": "application/json"
     }
 
-    # 1. Get Latest Observation
+    # 1. Get Latest Observation (Convert C to F)
     try:
         params = {"station_code": station_code, "mode": "latest"}
         r = requests.get(endpoint, headers=headers, params=params, timeout=5)
         if r.status_code == 200:
             data = r.json() 
-            if isinstance(data, dict):
-                latest_val = data.get('temp', data.get('temperature', data.get('value')))
-            else: latest_val = float(data)
+            temp_c = data.get('temperature')
+            if temp_c is not None:
+                latest_f = (float(temp_c) * 1.8) + 32
     except: pass
 
-    # 2. Get Wethr High
+    # 2. Get Wethr High (Already F)
     try:
         params = {"station_code": station_code, "mode": "wethr_high"}
         r = requests.get(endpoint, headers=headers, params=params, timeout=5)
         if r.status_code == 200:
             data = r.json()
-            if isinstance(data, dict):
-                # The API documentation example says "highest_probable_f" or similar, 
-                # but "wethr_high" mode usually returns the calculated value directly or in a field.
-                # Adjusting based on standard responses for high/temp.
-                high_val = data.get('high', data.get('value', data.get('temp')))
-            else: high_val = float(data)
+            high_f = data.get('wethr_high')
     except: pass
     
-    return latest_val, high_val
+    return latest_f, high_f
 
 def track_model_history(station_code, model_name, today_val, tmw_val):
     if not os.path.exists("Kalshi"): os.makedirs("Kalshi")
@@ -534,11 +529,11 @@ def get_kalshi():
 def calculate_weighted_blend(city_rows):
     weights = {
         'NWS Official': 5.0, 
-        'NBM': 4.0,           
+        'NBM': 4.0,            
         'LAMP': 3.5,         
         'GFS MOS': 2.0,      
         'NAM MOS': 2.0,       
-        'HRRR': 1.5,         
+        'HRRR': 1.5,          
         'ECMWF': 1.0,        
         'GFS': 0.5,
         'GEM': 0.5,
@@ -551,6 +546,8 @@ def calculate_weighted_blend(city_rows):
     for r in city_rows:
         model_name = r['Model']
         if "Prev" in model_name: continue
+        
+        # Exclude Wethr from weighted blend as requested
         if "Wethr" in model_name: continue
 
         w = weights.get(model_name, 0.5) 
@@ -567,7 +564,7 @@ def calculate_weighted_blend(city_rows):
     tmw_blend = t2_sum / t2_w_sum if t2_w_sum > 0 else None
     return today_blend, tmw_blend
 
-def build_html(full_data, ml_preds, kalshi_df, history):
+def build_html(full_data, ml_preds, kalshi_df, history, wethr_stats):
     now_utc = datetime.now(pytz.utc)
     now_est = now_utc.astimezone(pytz.timezone('US/Eastern'))
     time_est_str = now_est.strftime('%Y-%m-%d %I:%M:%S %p %Z')
@@ -597,7 +594,9 @@ def build_html(full_data, ml_preds, kalshi_df, history):
         .table thead th { color: #ffffff !important; background-color: #0f172a !important; border-bottom: 2px solid #64748b; vertical-align: middle; text-transform: uppercase; font-size: 0.75rem; letter-spacing: 0.5px; }
         .table-striped tbody tr:nth-of-type(odd) { background-color: rgba(255,255,255,0.03); }
         .table td { border-color: #334155; vertical-align: middle; }
-        .badge-ml { background:#0ea5e9; color: white; font-size: 0.9rem; }
+        .badge-ml { background:#0ea5e9; color: white; font-size: 0.9rem; margin-left: 5px; }
+        .badge-wethr-latest { background:#10b981; color: white; font-size: 0.9rem; margin-left: 5px; }
+        .badge-wethr-high { background:#f97316; color: white; font-size: 0.9rem; margin-left: 5px; }
         .kalshi-btn { font-size: 0.7rem; padding: 2px 10px; margin-left: 10px; }
         .btn-cyan { background-color: #06b6d4; color: white; border: none; }
         .btn-cyan:hover { background-color: #0891b2; color: white; }
@@ -626,6 +625,13 @@ def build_html(full_data, ml_preds, kalshi_df, history):
         city_hist = history.get(code, [])
         k_all = kalshi_df[kalshi_df['Airport'] == code].copy() if not kalshi_df.empty else pd.DataFrame()
         
+        # Get Wethr stats for header
+        w_latest, w_high = wethr_stats.get(code, ("N/A", "N/A"))
+        
+        # Format strings for badges
+        str_latest = f"{w_latest:.1f}°F" if isinstance(w_latest, float) else "N/A"
+        str_high = f"{w_high}°F" if w_high is not None else "N/A"
+        
         wb_today, wb_tmw = calculate_weighted_blend(city_rows)
 
         def calculate_market_value(r, current_forecasts):
@@ -644,7 +650,6 @@ def build_html(full_data, ml_preds, kalshi_df, history):
                 if temp < r['Low']: dist = r['Low'] - temp
                 elif temp > r['High']: dist = temp - r['High']
                 
-                # --- UPDATED SCORING RULES ---
                 if model in ['LAMP', 'HRRR', 'GFS MOS', 'NAM MOS', 'NBM']: 
                     total_possible += 5
                     if dist == 0: score += 5
@@ -676,7 +681,13 @@ def build_html(full_data, ml_preds, kalshi_df, history):
         k_today_rows = make_k_table(k_all[k_all['Day'] == 'Today'].copy())
         k_tmw_rows = make_k_table(k_all[k_all['Day'] == 'Tomorrow'].copy())
 
-        html += f"""<div class="row"><div class="col-12"><h4>{cfg['name']} ({code}) <span class="badge badge-ml">Live ML: {city_ml[0]}</span></h4></div>
+        # --- HEADER INJECTION ---
+        html += f"""<div class="row"><div class="col-12">
+        <h4>{cfg['name']} ({code}) 
+            <span class="badge badge-ml">Live ML: {city_ml[0]}</span>
+            <span class="badge badge-wethr-latest">Latest: {str_latest}</span>
+            <span class="badge badge-wethr-high">Wethr High: {str_high}</span>
+        </h4></div>
         
         <div class="col-md-5"><div class="card"><div class="card-header">Forecast Models</div><table class="table table-dark table-sm mb-0">
         <thead><tr><th class="col-model" style="color:#fff !important">Model</th><th class="col-temp" style="color:#fff !important">Today High</th><th class="col-temp" style="color:#fff !important">Tom High</th></tr></thead><tbody>"""
@@ -705,15 +716,16 @@ def build_html(full_data, ml_preds, kalshi_df, history):
 if __name__ == "__main__":
     print("STARTING WEATHER MASTER V17...")
     full_data, ml_preds, history = [], {}, {}
+    wethr_stats = {} # New dictionary to hold Wethr data separately
     
     # 1. Run Data Collection
     for code, cfg in LOCATIONS.items():
         print(f"Processing {code}...")
         
-        # --- 0. Wethr API (Custom) ---
+        # --- 0. Wethr API (Separate Collection) ---
+        # Fetching data: Latest (C->F) and High (F)
         w_live, w_high = get_wethr_data(cfg['station_id'])
-        if w_live is not None or w_high is not None:
-             full_data.append({'Airport': code, 'Model': f"Wethr (Live {w_live})", 'Today': w_high, 'Tomorrow': None})
+        wethr_stats[code] = (w_live, w_high) # Store for Header
 
         # --- 1. ML Prediction ---
         pred, note = get_live_ml_prediction(cfg['station_id'])
@@ -788,6 +800,6 @@ if __name__ == "__main__":
     output_path = os.path.join(output_dir, "weather_dashboard.html")
     
     with open(output_path, "w", encoding="utf-8") as f: 
-        f.write(build_html(full_data, ml_preds, kalshi, history))
+        f.write(build_html(full_data, ml_preds, kalshi, history, wethr_stats))
     
     print(f"SUCCESS: Dashboard saved to {output_path}")
