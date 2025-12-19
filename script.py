@@ -195,7 +195,12 @@ def get_wethr_data(station_code):
     
     return latest_f, high_f
 
-def track_model_history(station_code, model_name, today_val, tmw_val):
+def track_model_history(station_code, model_name, today_val, tmw_val, tz_str):
+    """
+    Manages history for models. 
+    1. Ensures we only keep history relevant to the CURRENT local date.
+    2. Stores at most the current run + 2 previous distinct runs.
+    """
     if not os.path.exists("Kalshi"): os.makedirs("Kalshi")
     file_path = f"Kalshi/{station_code}_{model_name}_log.json"
     history = []
@@ -205,9 +210,19 @@ def track_model_history(station_code, model_name, today_val, tmw_val):
             with open(file_path, 'r') as f: history = json.load(f)
         except: pass
 
+    # Get local date to flush old history
+    tz = pytz.timezone(tz_str)
+    local_now = datetime.now(tz)
+    local_date_str = local_now.strftime('%Y-%m-%d')
+    
+    # Filter history: Keep only entries that belong to TODAY's date
+    # (assuming we added a 'date' field, if not, we rely on 'ts' but this is safer)
+    valid_history = [h for h in history if h.get('date_str') == local_date_str]
+    
+    # Check if new value is distinct from the most recent valid entry
     is_new = True
-    if history:
-        last = history[0]
+    if valid_history:
+        last = valid_history[0]
         if last['today'] == today_val and last['tmw'] == tmw_val:
             is_new = False
 
@@ -215,15 +230,18 @@ def track_model_history(station_code, model_name, today_val, tmw_val):
         now_utc = datetime.now(pytz.utc)
         new_entry = {
             'ts': now_utc.strftime('%Y-%m-%d %H:%M'), 
-            'label': now_utc.strftime('%H:%M'),       
+            'label': now_utc.strftime('%H:%M'),
+            'date_str': local_date_str, # Store local date to filter against later
             'today': today_val, 
             'tmw': tmw_val
         }
-        history.insert(0, new_entry)
+        valid_history.insert(0, new_entry)
         
-    history = history[:10]
-    with open(file_path, 'w') as f: json.dump(history, f)
-    return history
+    # Keep only top 3 (Current + 2 previous)
+    valid_history = valid_history[:3]
+    
+    with open(file_path, 'w') as f: json.dump(valid_history, f)
+    return valid_history
 
 def get_lamp_data(station, tz_str):
     history = []
@@ -655,6 +673,14 @@ def build_html(full_data, ml_preds, kalshi_df, history, wethr_stats):
             score = 0
             total_possible = 0
             
+            # --- NEW: Check against Wethr High Buster Logic ---
+            # If checking TODAY, and we have a valid High already:
+            if r['Day'] == 'Today' and w_high is not None and isinstance(w_high, (int, float)):
+                # If current high is already > Range High (busted)
+                # AND it is NOT an "Above" bucket (High=999)
+                if w_high > r['High'] and r['High'] != 999:
+                    return 0 # Invalid contract, already busted
+            
             for f in current_forecasts:
                 model = f['Model']
                 if "Prev" in model or "Wethr" in model: continue 
@@ -790,11 +816,12 @@ if __name__ == "__main__":
             if g_t: 
                 full_data.append({'Airport': code, 'Model': name, 'Today': g_t, 'Tomorrow': g_tm})
                 
-                model_hist = track_model_history(code, name, g_t, g_tm)
+                # --- PASSING TIMEZONE TO HISTORY TRACKER ---
+                model_hist = track_model_history(code, name, g_t, g_tm, cfg['tz'])
                 
                 count = 0
                 for item in model_hist[1:]:
-                    if count >= 2: break
+                    if count >= 2: break # Keeps only 2 previous + 1 current
                     full_data.append({
                         'Airport': code, 
                         'Model': f"{name} (Prev {item['label']})", 
@@ -819,5 +846,3 @@ if __name__ == "__main__":
         f.write(build_html(full_data, ml_preds, kalshi, history, wethr_stats))
     
     print(f"SUCCESS: Dashboard saved to {output_path}")
-
-
