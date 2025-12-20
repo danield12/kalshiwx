@@ -2,8 +2,13 @@ name: Hourly Weather Scrape
 
 on:
   schedule:
-    - cron: '*/15 * * * *'  # CHANGED: Runs every 15 minutes
-  workflow_dispatch:        # Allows you to click "Run Now" manually to test
+    - cron: '*/15 * * * *'  # Runs every 15 minutes
+  workflow_dispatch:        # Allows you to click "Run Now" manually
+
+# This prevents multiple runs from overlapping and fighting over the git history
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 # ⚠️ CRITICAL: This gives the bot permission to write to your repo
 permissions:
