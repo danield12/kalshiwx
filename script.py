@@ -457,90 +457,64 @@ def get_nws_official(lat, lon, tz_str):
 
 def get_nws_hourly(lat, lon, tz_str):
     """
-    Scrapes the NWS Digital Forecast (MapClick) hourly table.
-    Extracts high temp for 'Today' and 'Tomorrow' based on local time.
+    Fetches NWS Hourly Forecast via API (api.weather.gov).
+    Replaces the old HTML scraper to ensure robust 7-day data access.
     """
     try:
-        url = f"https://forecast.weather.gov/MapClick.php?lat={lat}&lon={lon}&lg=english&&FcstType=digital"
-        # Standard User-Agent to avoid 403
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        # NWS API requires a User-Agent identifying the app/contact
+        headers = {
+            'User-Agent': '(WeatherMasterV18, contact@example.com)',
+            'Accept': 'application/geo+json'
+        }
         
-        r = requests.get(url, headers=headers, timeout=5)
+        # 1. Get Gridpoint Metadata
+        # We need to translate Lat/Lon into a Grid ID (wfo/x/y)
+        point_url = f"https://api.weather.gov/points/{lat},{lon}"
+        r_point = requests.get(point_url, headers=headers, timeout=5)
         
-        # Parse all tables found in the HTML
-        dfs = pd.read_html(r.content)
+        if r_point.status_code != 200:
+            return None, None
+            
+        point_data = r_point.json()
+        forecast_hourly_url = point_data['properties']['forecastHourly']
         
-        # Locate the correct table by looking for "Temperature" in the first column
-        df = None
-        for d in dfs:
-            # Check if first column (regardless of header) contains 'Temperature'
-            if d.iloc[:, 0].astype(str).str.contains('Temperature').any():
-                df = d
-                break
+        # 2. Get Hourly Forecast Data
+        r_forecast = requests.get(forecast_hourly_url, headers=headers, timeout=5)
         
-        if df is None: return None, None
+        if r_forecast.status_code != 200:
+            return None, None
+            
+        periods = r_forecast.json()['properties']['periods']
         
-        # Identify row indices
-        # The table structure usually has variable names in the first column (index 0)
-        col0 = df.iloc[:, 0].astype(str)
-        
-        # Find row indices for Date and Temperature
-        date_rows = df[col0.str.contains('Date', case=False, na=False)].index
-        temp_rows = df[col0.str.contains('Temperature', case=False, na=False)].index
-        
-        if len(date_rows) == 0 or len(temp_rows) == 0: return None, None
-        
-        date_row_idx = date_rows[0]
-        temp_row_idx = temp_rows[0]
-        
-        # Extract data (ignoring the first column which is the label)
-        # We must forward-fill the date row because NWS merges cells for dates
-        raw_dates = df.iloc[date_row_idx, 1:].ffill() 
-        raw_temps = df.iloc[temp_row_idx, 1:]
-        
-        # Setup Local Time context
+        # 3. Filter for Today and Tomorrow based on Local Time
         tz = pytz.timezone(tz_str)
         now = datetime.now(tz)
         today_date = now.date()
         tmw_date = today_date + timedelta(days=1)
         
-        # Helper to parse "12/29" or "Mon 12/29" into a date object
-        def parse_nws_date_str(d_str):
-            try:
-                # Take last part to handle "Mon 12/29" -> "12/29"
-                clean_str = str(d_str).split()[-1]
-                # Assume current year
-                dt = datetime.strptime(f"{now.year}/{clean_str}", "%Y/%m/%d").date()
-                # Handle Year Rollover (e.g. It's Dec, Forecast is Jan)
-                if now.month == 12 and dt.month == 1:
-                    dt = dt.replace(year=now.year + 1)
-                return dt
-            except: return None
-            
-        today_vals = []
-        tmw_vals = []
+        today_temps = []
+        tmw_temps = []
         
-        # Iterate through columns
-        for d_val, t_val in zip(raw_dates, raw_temps):
-            dt_obj = parse_nws_date_str(d_val)
-            if not dt_obj: continue
+        for p in periods:
+            # Parse NWS timestamp (ISO 8601)
+            dt_raw = datetime.fromisoformat(p['startTime'])
+            dt_local = dt_raw.astimezone(tz)
+            date_val = dt_local.date()
+            temp = p['temperature']
             
-            try:
-                t_int = int(t_val)
-            except: continue
-            
-            if dt_obj == today_date:
-                today_vals.append(t_int)
-            elif dt_obj == tmw_date:
-                tmw_vals.append(t_int)
+            if date_val == today_date:
+                today_temps.append(temp)
+            elif date_val == tmw_date:
+                tmw_temps.append(temp)
                 
-        t_high = max(today_vals) if today_vals else None
-        tm_high = max(tmw_vals) if tmw_vals else None
+        # 4. Calculate Highs
+        t_high = max(today_temps) if today_temps else None
+        tm_high = max(tmw_temps) if tmw_temps else None
         
         return t_high, tm_high
 
     except Exception as e:
-        # print(f"NWS Hourly Error: {e}") # Debug only
+        # print(f"NWS Hourly API Error: {e}") 
         return None, None
 
 def get_global_model(lat, lon, tz, model_code):
@@ -943,3 +917,4 @@ if __name__ == "__main__":
         f.write(build_html(full_data, ml_preds, kalshi, history, wethr_stats))
     
     print(f"SUCCESS: Dashboard saved to {output_path}")
+
