@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from io import StringIO
 from sklearn.ensemble import HistGradientBoostingRegressor
 import pytz
-from scipy.stats import norm  # <--- NEW IMPORT FOR PROBABILITY
+from scipy.stats import norm
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
@@ -455,6 +455,94 @@ def get_nws_official(lat, lon, tz_str):
         return t_high, tm_high
     except: return None, None
 
+def get_nws_hourly(lat, lon, tz_str):
+    """
+    Scrapes the NWS Digital Forecast (MapClick) hourly table.
+    Extracts high temp for 'Today' and 'Tomorrow' based on local time.
+    """
+    try:
+        url = f"https://forecast.weather.gov/MapClick.php?lat={lat}&lon={lon}&lg=english&&FcstType=digital"
+        # Standard User-Agent to avoid 403
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        
+        r = requests.get(url, headers=headers, timeout=5)
+        
+        # Parse all tables found in the HTML
+        dfs = pd.read_html(r.content)
+        
+        # Locate the correct table by looking for "Temperature" in the first column
+        df = None
+        for d in dfs:
+            # Check if first column (regardless of header) contains 'Temperature'
+            if d.iloc[:, 0].astype(str).str.contains('Temperature').any():
+                df = d
+                break
+        
+        if df is None: return None, None
+        
+        # Identify row indices
+        # The table structure usually has variable names in the first column (index 0)
+        col0 = df.iloc[:, 0].astype(str)
+        
+        # Find row indices for Date and Temperature
+        date_rows = df[col0.str.contains('Date', case=False, na=False)].index
+        temp_rows = df[col0.str.contains('Temperature', case=False, na=False)].index
+        
+        if len(date_rows) == 0 or len(temp_rows) == 0: return None, None
+        
+        date_row_idx = date_rows[0]
+        temp_row_idx = temp_rows[0]
+        
+        # Extract data (ignoring the first column which is the label)
+        # We must forward-fill the date row because NWS merges cells for dates
+        raw_dates = df.iloc[date_row_idx, 1:].ffill() 
+        raw_temps = df.iloc[temp_row_idx, 1:]
+        
+        # Setup Local Time context
+        tz = pytz.timezone(tz_str)
+        now = datetime.now(tz)
+        today_date = now.date()
+        tmw_date = today_date + timedelta(days=1)
+        
+        # Helper to parse "12/29" or "Mon 12/29" into a date object
+        def parse_nws_date_str(d_str):
+            try:
+                # Take last part to handle "Mon 12/29" -> "12/29"
+                clean_str = str(d_str).split()[-1]
+                # Assume current year
+                dt = datetime.strptime(f"{now.year}/{clean_str}", "%Y/%m/%d").date()
+                # Handle Year Rollover (e.g. It's Dec, Forecast is Jan)
+                if now.month == 12 and dt.month == 1:
+                    dt = dt.replace(year=now.year + 1)
+                return dt
+            except: return None
+            
+        today_vals = []
+        tmw_vals = []
+        
+        # Iterate through columns
+        for d_val, t_val in zip(raw_dates, raw_temps):
+            dt_obj = parse_nws_date_str(d_val)
+            if not dt_obj: continue
+            
+            try:
+                t_int = int(t_val)
+            except: continue
+            
+            if dt_obj == today_date:
+                today_vals.append(t_int)
+            elif dt_obj == tmw_date:
+                tmw_vals.append(t_int)
+                
+        t_high = max(today_vals) if today_vals else None
+        tm_high = max(tmw_vals) if tmw_vals else None
+        
+        return t_high, tm_high
+
+    except Exception as e:
+        # print(f"NWS Hourly Error: {e}") # Debug only
+        return None, None
+
 def get_global_model(lat, lon, tz, model_code):
     for attempt in range(4):
         try:
@@ -551,12 +639,13 @@ def get_kalshi():
 def calculate_weighted_blend(city_rows):
     weights = {
         'NWS Official': 5.0, 
+        'NWS Hourly': 4.5,      # NEW High Confidence Source
         'NBM': 4.0,            
-        'LAMP': 3.5,         
-        'GFS MOS': 2.0,      
-        'NAM MOS': 2.0,       
-        'HRRR': 1.5,          
-        'ECMWF': 1.0,        
+        'LAMP': 3.5,          
+        'GFS MOS': 2.0,       
+        'NAM MOS': 2.0,        
+        'HRRR': 1.5,           
+        'ECMWF': 1.0,         
         'GFS': 0.5,
         'GEM': 0.5,
         'ICON': 0.5
@@ -592,7 +681,7 @@ def build_html(full_data, ml_preds, kalshi_df, history, wethr_stats):
     time_est_str = now_est.strftime('%Y-%m-%d %I:%M:%S %p %Z')
     time_utc_str = now_utc.strftime('%Y-%m-%d %H:%M:%S %Z')
 
-    html = """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Weather Master V17</title>
+    html = """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Weather Master V18</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <script>
     function toggleKalshi(city) {
@@ -633,7 +722,7 @@ def build_html(full_data, ml_preds, kalshi_df, history, wethr_stats):
     </head><body class="p-4">
     
     <div class="d-flex justify-content-between align-items-end mb-2">
-        <h3 class="m-0">⚡ Weather Master V17 <small class="text-muted fs-6 ms-2">Weighted Consensus</small></h3>
+        <h3 class="m-0">⚡ Weather Master V18 <small class="text-muted fs-6 ms-2">Weighted Consensus</small></h3>
         <div class="text-end" style="font-size: 0.85rem; color: #94a3b8;">
             <div>Run Time (EST): <span style="color:#e2e8f0; font-weight:600">""" + time_est_str + """</span></div>
             <div>Run Time (UTC): <span style="color:#e2e8f0; font-weight:600">""" + time_utc_str + """</span></div>
@@ -671,7 +760,7 @@ def build_html(full_data, ml_preds, kalshi_df, history, wethr_stats):
             
             # Use same weights as main consensus
             model_weights = {
-                'NWS Official': 5.0, 'NBM': 4.0, 'LAMP': 3.5, 
+                'NWS Official': 5.0, 'NWS Hourly': 4.5, 'NBM': 4.0, 'LAMP': 3.5, 
                 'GFS MOS': 2.0, 'NAM MOS': 2.0, 'HRRR': 1.5, 
                 'ECMWF': 1.0, 'GFS': 0.5, 'GEM': 0.5, 'ICON': 0.5
             }
@@ -758,7 +847,7 @@ def build_html(full_data, ml_preds, kalshi_df, history, wethr_stats):
     return html + "</body></html>"
 
 if __name__ == "__main__":
-    print("STARTING WEATHER MASTER V17...")
+    print("STARTING WEATHER MASTER V18...")
     full_data, ml_preds, history = [], {}, {}
     wethr_stats = {} # New dictionary to hold Wethr data separately
     
@@ -780,6 +869,12 @@ if __name__ == "__main__":
         if n_t is not None or n_tm is not None:
             full_data.append({'Airport': code, 'Model': 'NWS Official', 'Today': n_t, 'Tomorrow': n_tm})
         time.sleep(0.2) 
+
+        # --- NEW: NWS Hourly (Digital Forecast) ---
+        nh_t, nh_tm = get_nws_hourly(cfg['lat'], cfg['lon'], cfg['tz'])
+        if nh_t is not None or nh_tm is not None:
+             full_data.append({'Airport': code, 'Model': 'NWS Hourly', 'Today': nh_t, 'Tomorrow': nh_tm})
+        time.sleep(0.2)
         
         # --- 3. LAMP ---
         l_t, l_tm, l_h = get_lamp_data(cfg['station_id'], cfg['tz'])
@@ -796,7 +891,7 @@ if __name__ == "__main__":
                 full_data.append({'Airport': code, 'Model': f"GFS MOS (Prev {old_run['run_str']})", 'Today': old_run['today'], 'Tomorrow': old_run['tmw']})
         time.sleep(0.2) 
 
-        # --- NEW: NAM MOS ---
+        # --- 5. NAM MOS ---
         nam_list = get_mos_base(cfg['station_id'], cfg['tz'], "NAM")
         if nam_list:
             best = nam_list[0]
@@ -805,13 +900,13 @@ if __name__ == "__main__":
                 full_data.append({'Airport': code, 'Model': f"NAM MOS (Prev {old_run['run_str']})", 'Today': old_run['today'], 'Tomorrow': old_run['tmw']})
         time.sleep(0.2)
 
-        # --- NEW: NBM (National Blend) ---
+        # --- 6. NBM (National Blend) ---
         nbm_t, nbm_tm = get_nbm_data(cfg['station_id'], cfg['tz'])
         if nbm_t is not None:
              full_data.append({'Airport': code, 'Model': 'NBM', 'Today': nbm_t, 'Tomorrow': nbm_tm})
         time.sleep(0.2)
 
-        # --- 5. Global Models (Open-Meteo) ---
+        # --- 7. Global Models (Open-Meteo) ---
         for name, m_code in GLOBAL_MODELS.items():
             g_t, g_tm = get_global_model(cfg['lat'], cfg['lon'], cfg['tz'], m_code)
             
@@ -848,4 +943,3 @@ if __name__ == "__main__":
         f.write(build_html(full_data, ml_preds, kalshi, history, wethr_stats))
     
     print(f"SUCCESS: Dashboard saved to {output_path}")
-
